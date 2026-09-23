@@ -1,86 +1,85 @@
-# Integration Platform — Arquitetura Técnica (NestJS)
+# Marketplace — Módulo de Integrações Reutilizável (Arquitetura DataCrazy)
 
-> Documento arquitetural crítico, não um tutorial de código. Os trechos TypeScript são **contratos conceituais** (assinaturas de interfaces/abstrações), não implementação completa. O objetivo é decidir a forma antes de escrever a primeira linha de produção.
-
----
-
-## 0. Diagnóstico crítico do que você propôs
-
-Antes de desenhar a arquitetura "certa", vale confrontar diretamente as premissas do enunciado — porque várias delas estão corretas, mas incompletas ou perigosas se levadas ao pé da letra.
-
-**`IntegrationDefinition { providerId, type, capabilities }` — está incompleta, não errada.**
-Essa modelagem é o ponto de partida certo, mas se `capabilities` for só uma lista de enums (`['AUTH','WEBHOOK','ORDERS']`), você recria o problema que está tentando evitar: em algum lugar vai existir um `if (capabilities.includes('ORDERS'))` seguido de um cast inseguro para pegar a implementação. Capability precisa ser **um objeto tipado que carrega a implementação**, não uma flag. Detalho isso na seção 14.
-
-**`providerId + integrationType` como chave de resolução — correta, e deve ser respeitada como composta, nunca "achatada".**
-A tentação natural é usar só `providerId` como chave global (é único na prática: `tray`, `yampi`, `hotmart` nunca colidem). Mas resolver por chave composta `(type, providerId)` é uma decisão de design, não uma necessidade técnica imediata — e ela paga dividendos: (1) o namespace do registry fica particionado por domínio, o que facilita autorização ("este tenant só pode habilitar integrações do tipo ECOMMERCE"), roteamento de webhook e organização de módulos; (2) evita colisão futura se dois domínios usarem o mesmo nome comercial (ex.: um "Stripe" genérico usado tanto em PAYMENT quanto embutido em outro domínio). Mantenha a chave composta.
-
-**Kafka no core ou na infraestrutura? Infraestrutura, sem exceção.**
-O *core* da plataforma não deve conhecer Kafka como conceito — deve conhecer uma **porta** (`EventPublisher`, `EventConsumer`) que a infraestrutura implementa com KafkaJS/`@nestjs/microservices`. Isso não é purismo: é o que permite trocar Kafka por SQS ou testar o pipeline de webhook inteiro em memória, sem broker, em CI. Detalho em 9 e 10.
-
-**Webhook é capability? Sim, mas não é uma interface única — é um *bundle* de porta + implementação.**
-"Webhook" não é um verbo único (`handle(payload)`). É um conjunto: verificação de assinatura, parsing, identificação de tipo de evento, normalização. Modelar como uma única interface gorda (`WebhookHandler.handle()`) empurra toda a lógica provider-specific para dentro de um método só, dificultando reuso do pipeline comum. Melhor: a capability "webhook" é satisfeita por um **adapter** que implementa passos pequenos e plugáveis num **pipeline genérico do core**. Seção 9.
-
-**Authentication é capability? Sim, e deve ser modelada por composição de Strategy, não por herança de "tipos de integração autenticada".**
-Nunca crie `OAuthIntegration extends BaseIntegration`. A integração *tem* uma estratégia de autenticação (composição), não *é* uma estratégia. Seção 13.
-
-**Canonical models são adequados? Sim, mas só para os recursos que você vai efetivamente *consultar/cruzar* entre providers (Order, Customer, Product, Payment). Não force canonicalização de tudo.** Detalho o critério em 15 — o erro mais comum em plataformas de integração é o "lowest common denominator" que você já identificou como risco: um modelo canônico empobrecido que ninguém usa porque perdeu informação relevante do provider.
-
-**Sua hierarquia de herança `BaseIntegration → EcommerceIntegration → TrayIntegration` está errada, e você mesmo já suspeitava.** Herança de domínio é o erro clássico de frameworks internos que “engessam” com o tempo: assim que a 6ª integração de e-commerce tiver uma capability que as outras 5 não têm, ou não tiver uma que as outras têm, a hierarquia quebra ou vira um `EcommerceIntegrationWithoutRefundsBase`. Composição resolve isso de forma natural (seção 26-27).
-
-Com isso resolvido, seguimos para o desenho.
+> Documento arquitetural, não um tutorial. Os trechos TypeScript são **contratos conceituais** (formato de interfaces/abstrações), baseados em padrões que **já existem e são usados em produção** no DataCrazy — não em abstrações inventadas para este projeto. A regra de ouro: *antes de criar qualquer abstração nova, procure o padrão equivalente que já roda no monorepo e reuse*.
+>
+> Referências usadas: `datacrazy-services/libs/*`, `datacrazy-services/src/services/crm/src/modules/integrations`, `datacrazy-services/src/services/messaging/src/modules/{engines,instances,universal-connection}`, `libs/events/ecommerce/ecommerce-webhook.event.ts`.
 
 ---
 
-## 1. Arquitetura recomendada (visão geral)
+## 0. Diagnóstico: o que já existe no DataCrazy e o que precisa ser criado
 
-Três eixos ortogonais, nunca misturados em uma única hierarquia de classes:
+Antes de desenhar, vale separar o que **não é trabalho novo** — porque o monorepo já resolve — do que **é trabalho novo** de verdade.
 
-1. **Domain (IntegrationType)** — classificação de negócio (ECOMMERCE, INFOPRODUCT, CRM, PAYMENT...). Não implica comportamento técnico.
-2. **Provider (providerId)** — quem implementa capabilities concretas para um domínio (`tray`, `yampi`, `hotmart`). É o ponto de composição.
-3. **Capability** — comportamento reutilizável e opcional (`AUTH`, `WEBHOOK`, `ORDERS`, `PRODUCTS`, `CUSTOMERS`, `REFUNDS`...). É o que o *core* consome via porta/interface, nunca via `providerId`.
+| Tema | Já existe no DataCrazy | Precisa ser criado |
+|---|---|---|
+| Provider pluggable / registry por token | ✅ CRM `"INTEGRATIONS"` (array `integrations`) e messaging `"CHAT_SERVICES"`/`"CONTACT_SERVICES"`/`"CONFIGURATION_SERVICES"` + resolvers (`engines.providers.module.ts`) | Nada — só replicar o padrão no marketplace |
+| Entidade persistida por tenant com `type`/`providerId`/`fields` | ✅ CRM `Integration` (domain) e `Instance` (messaging) | Evoluir para `IntegrationDefinition` (estático) × `IntegrationInstance` (tenant) |
+| Webhook público seguro (assinatura + throttle + troca de tenant) | ✅ Padrão `@Public()` + `@WebhookThrottler()` + `SessionContext.changeTenant()` em todos os providers (tray, api4com, wavoip, whatsapp-cloud, universal...) | Nada — copiar o esqueleto |
+| Consumidor cross-service de evento externo | ✅ `EcommerceWebhookKafkaEvent` + `@KafkaTopic` + `EventHandler` (tray → flow trigger via `TrayIntegrationEventHandler`) | Reusar, criando os eventos do marketplace |
+| Filas com contexto de sessão restaurado | ✅ `QueueModule.registerQueue` + `registerProcessor`, `QueueProcessor` (restaura `sessionContext` de `QueueData`) | Nada |
+| Lock distribuído / idempotência | ✅ `DistributedLockService.executeWithLock` (chave prefixada por tenant), idempotência/dedup no `QueueManager` | Porta de `IdempotencyStore` de longa duração se precisar de TTL > fila |
+| Criptografia de credenciais | ✅ `CryptoHelpers.encrypt/decrypt` (AES-256-CBC) | **Porta `CredentialVault`** para isolar quem guarda o quê |
+| Auth genérico (OAuth2/ApiKey/... reutilizável entre providers) | ❌ OAuth vive duplicado em `tray-authenticator.service.ts` e `whatsapp-cloud.auth.controller.ts` | **Strategies genéricas** em `libs/shared` (seção 11) |
+| Integração "genérica config-driven" | ✅ `universal-connection` (config declarativa `send`/`receive`/`auth`/`credentials`) | Referência para o "conector genérico" do marketplace |
+| Mapeamento canônico (Order/Customer/Product) | ❌ Nenhum canonical model cross-provider | Ícone central do marketplace (seção 13) |
+| Catálogo/definição estática de provider | ✅ nenhum (só `types.enum.ts` com 5 tipos) | **`IntegrationDefinition` + `CapabilitySet`** (seção 4) |
 
-O core da plataforma **nunca** pergunta "quem é o provider" para decidir comportamento. Ele pergunta "esse provider tem a capability X?" e, se sim, invoca a porta correspondente. Quem sabe que "Tray" ↔ implementação concreta de `OrderReader` é exclusivamente o **Provider Registry**, construído via DI do NestJS.
-
-Camadas (de dentro para fora, dependências sempre apontando para dentro — Dependency Inversion):
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Infrastructure (Kafka, HTTP clients, DB, cron, signature)│
-│   ┌─────────────────────────────────────────────────┐   │
-│   │ Adapters (Provider-specific: Tray, Yampi, Hotmart)│  │
-│   │   ┌───────────────────────────────────────────┐  │   │
-│   │   │ Application (use cases, handlers, mappers) │  │   │
-│   │   │   ┌─────────────────────────────────────┐  │  │   │
-│   │   │   │ Domain (Order, Customer, eventos)   │  │  │   │
-│   │   │   └─────────────────────────────────────┘  │  │   │
-│   │   └───────────────────────────────────────────┘  │   │
-│   └─────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
-```
-
-Ports (interfaces) vivem no core/domain. Adapters (Tray, Yampi...) e infra (Kafka, HTTP) implementam essas ports. O NestJS DI é o mecanismo físico que faz essa inversão acontecer sem `if/switch`.
+**A decisão arquitetural mais importante deste documento:** o marketplace não deve desenhar um "framework de integrações" do zero. Ele deve **promover a abstração que já existe no CRM (`IntegrationService`/`IntegrationWebhookService`/`IntegrationResolver`)** para o nível de *definition/capability*, e **plagiar o registry por token nomeado do messaging** — isso é o esqueleto do que você quer. O resto é encaixar as peças compartilhadas já prontas.
 
 ---
 
-## 2. Modelo conceitual
+## 1. O modelo mental do marketplace (três eixos ortogonais)
+
+Nunca misture os três em uma única hierarquia de classes (é o erro clássico que gera `EcommerceIntegrationWithoutRefundsBase`):
+
+1. **Type / Domínio** — classificação de negócio (`ECOMMERCE`, `INFOPRODUTO`, `CRM`, `PAYMENT`, `SHIPPING`...). Não implica comportamento técnico.
+2. **Provider** — quem implementa capabilities concretas (`tray`, `yampi`, `hotmart`, `shopify`...). É o ponto de composição.
+3. **Capability** — comportamento reutilizável e opcional (`AUTH`, `WEBHOOK`, `ORDERS`, `PRODUCTS`, `CUSTOMERS`, `REFUNDS`, `SALES`...). É o que o core consome via **porta tipada**, nunca via `providerId`.
+
+O core do marketplace **nunca** pergunta "quem é o provider" para decidir comportamento. Ele pergunta "esse provider tem a capability X?" e, se sim, invoca a porta correspondente. Quem sabe que `tray` ↔ implementação concreta de `OrderCapability` é **exclusivamente o Registry** — o mesmo raciocínio dos resolvers `ChatServicesResolver`/`IntegrationResolver` que já existem.
+
+> No DataCrazy isso já está meio feito em duas versões imperfeitas:
+> - CRM (`integrations`) chegou em **type estruturado** (`IntegrationService.type` + array `integrations` + `IntegrationResolver`), mas sem capabilities — o `IntegrationWebhookService` está em outro array, desconectado do `IntegrationService`.
+> - Messaging (`engines`) chegou em **registry por token nomeado** (`"CHAT_SERVICES"` + resolvers), mas o "type" é o provider em si, sem domínio.
+>
+> O marketplace é a oportunidade de fazer **um** padrão completo: capability composta dentro da definition, um só registry.
+
+---
+
+## 2. Camadas (Dependency Inversion — como já é no monorepo)
 
 ```
-IntegrationType (enum)         — taxonomia de domínio
-  └── IntegrationDefinition    — "o que é" um provider (estático, sem tenant)
-        ├── providerId
-        ├── type: IntegrationType
-        ├── capabilities: CapabilitySet   (composição, não enum flat)
-        └── metadata (displayName, docsUrl, logo...)
-
-IntegrationInstance             — "quem usa" (tenant + credenciais + config)
-        ├── tenantId
-        ├── integrationDefinitionRef (type + providerId)
-        ├── credentials (opaco, criptografado)
-        ├── config (por instância: sandbox/prod, webhookSecret, etc.)
-        └── status (ACTIVE, DISABLED, ERROR)
+┌──────────────────────────────────────────────────────────────┐
+│ libs/shared (KafkaPubSub, QueueModule, DistributedLock,      │
+│              SessionContext, PrismaRepository, guards,       │
+│              CryptoHelpers, MicroserviceClient)              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │ Marketplace Core (REGISTRY + ports/capabilities +      │ │
+│  │              envelope)                                  │ │
+│  │   ┌──────────────────────────────────────────────────┐ │  │
+│  │   │ Providers (tray, yampi, hotmart...)               │ │ │
+│  │   │   └── Adapters/Strategies (auth, webhook, mapper)│ │ │
+│  │   └──────────────────────────────────────────────────┘ │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-`IntegrationDefinition` é singleton por provider (existe uma só definição de "Tray" no sistema). `IntegrationInstance` existe N vezes, uma por tenant que conectou aquele provider. Essa distinção é o tema da seção 6 e 14/15 do enunciado original (seção 14 aqui).
+Regra de import (idêntica à que o monorepo já respeita): o **core nunca importa provider**. A dependência é sempre `ProviderModule → CoreModule` (via `DataCrazyAppModule`/`DataCrazyModule`), nunca o inverso. O registry não conhece Tray — conhece a interface `IntegrationDefinition`.
+
+### Onde cada peça compartilhada entra
+
+| Peça do marketplace | Infra DataCrazy que implementa |
+|---|---|
+| Registry + resolvers | `IntegrationResolver` (CRM), resolvers do messaging — mesmo `useFactory(...services[]) => services` + token nomeado |
+| Publicação de eventos | `EventsPubSub.publish()` / `KafkaPubSub` — já injeta `event["sessionContext"]` |
+| Consumer | `@KafkaTopic({ pool: { concurrency } })` + `EventHandler` (restaura sessão + retry 3) |
+| Filas de processamento pesado | `QueueModule.registerQueue("nome")` + `registerProcessor(SeuProcessor)` (**as duas chamadas, não esquecer**) |
+| Idempotência do webhook | `DistributedLockService.executeWithLock` com `eventId`/`externalEventId` como chave + dedup do `QueueManager` |
+| Troca de tenant em webhook/consumer | `SessionContext.changeTenant(tenantId, ...)` — obrigatório em todo entrypoint público |
+| Persistência tenant-scoped | `PrismaRepository` (fixedWhere `{tenantId, deletedAt:null}`) |
+| Criptografia | `CryptoHelpers.encrypt/decrypt` (AES-256-CBC, `CRYPTO_SECRET_KEY`) |
+| Guards de rota | `@Public()` + `@WebhookThrottler()` + `@Roles`, `@PlanNotFree` |
+| Contratos cross-service | `DomainEvent`/`DomainRequest` em `libs/events`, `@MicroserviceRequestHandler` |
 
 ---
 
@@ -88,37 +87,38 @@ IntegrationInstance             — "quem usa" (tenant + credenciais + config)
 
 ```mermaid
 graph TB
-    subgraph Provider["Provider externo"]
+    subgraph Provider["Providers externos"]
         TRAY[Tray API/Webhook]
         YAMPI[Yampi API/Webhook]
         HOTMART[Hotmart API/Webhook]
     end
 
     subgraph Edge["HTTP Edge (rápido, sem lógica de negócio)"]
-        WC[WebhookController]
+        WC[MarketplaceWebhookController]
     end
 
-    subgraph Registry["Integration Registry (NestJS DI)"]
-        REG[IntegrationRegistry]
+    subgraph Registry["Marketplace Registry (token nomeado + resolver)"]
+        REG[MarketplaceRegistry]
         DEF[IntegrationDefinitions]
     end
 
-    subgraph Adapters["Provider Adapters"]
-        TA[TrayWebhookAdapter / TrayAuth / TrayOrderProvider]
-        YA[YampiWebhookAdapter / YampiAuth / YampiOrderProvider]
-        HA[HotmartWebhookAdapter / HotmartAuth / HotmartSaleProvider]
+    subgraph Adapters["Provider Adapters / Strategies"]
+        TA[Tray: AuthStrategy + WebhookAdapter + OrderProvider + Mapper]
+        YA[Yampi: OAuth2Strategy + WebhookAdapter + OrderProvider + Mapper]
+        HA[Hotmart: ClientCredentialsStrategy + WebhookAdapter + SaleProvider + Mapper]
     end
 
-    subgraph Async["Kafka (assíncrono)"]
-        TOPIC_RAW[(integration.webhook.received)]
-        TOPIC_DOM[(integration.ecommerce.order.created)]
-        CONSUMER[Webhook Consumer]
+    subgraph Infra["Infraestrutura compartilhada"]
+        QUEUE[QueueModule: marketplace-webhook-messages]
+        KFK[KafkaPubSub / EventBus]
+        LOCK[DistributedLockService]
+        CLS[SessionContext.changeTenant]
     end
 
     subgraph App["Application / Domain"]
-        HANDLER[IntegrationEventHandler]
+        HANDLER[MarketplaceEventHandler / QueueProcessor]
         SVC[Application Service]
-        DOM[Domain Model]
+        DOM[Canonical Models]
     end
 
     TRAY -->|POST webhook| WC
@@ -131,861 +131,499 @@ graph TB
     REG -.resolve.-> YA
     REG -.resolve.-> HA
 
-    WC --> TOPIC_RAW
-    TOPIC_RAW --> CONSUMER
-    CONSUMER --> REG
-    CONSUMER --> HANDLER
+    WC --> LOCK
+    WC --> QUEUE
+    QUEUE --> KFK
+    KFK --> HANDLER
     HANDLER --> SVC
     SVC --> DOM
-    SVC --> TOPIC_DOM
 ```
 
 ---
 
-## 4. Modelo `IntegrationDefinition`
+## 4. `IntegrationDefinition` (estático, sem tenant) × `IntegrationInstance` (tenant)
+
+Essa dupla é a evolução do que já existe:
+
+- O CRM tem `Integration` (persistida, com tenant — papel de **Instance**) mas não tem a **Definition** (o "catálogo": o que o provider *sabe fazer*).
+- O messaging tem `Instance` (provider/engine/config — papel de **Instance**), e o "catálogo" é apenas o array de providers no `engines.providers.module.ts`.
 
 ```typescript
-interface CapabilitySet {
-  auth?: AuthenticationCapability;
+// core/capabilities/capability-set.ts
+export type CapabilitySet = {
+  auth?: AuthenticationStrategy;          // presença = suporte (porta tipada, não flag)
   webhook?: WebhookCapability;
   orders?: OrderCapability;
-  customers?: CustomerCapability;
   products?: ProductCapability;
-  sales?: SaleCapability;       // infoproduto
-  subscriptions?: SubscriptionCapability;
-  // extensível sem alterar o core: cada capability é opcional
-}
+  customers?: CustomerCapability;
+  sales?: SaleCapability;                 // infoproduto
+  shipments?: ShipmentCapability;          // extensível SEM alterar o core
+  // cada capability é um campo opcional — novo provider só preenche o que tem
+};
 
-interface IntegrationDefinition {
-  readonly providerId: string;             // 'tray'
-  readonly type: IntegrationType;          // ECOMMERCE
+// core/domain/integration-definition.ts
+export class IntegrationDefinition {
+  readonly providerId: string;            // 'tray'
+  readonly type: IntegrationType;         // ECOMMERCE
   readonly displayName: string;
-  readonly capabilities: CapabilitySet;    // presença = suporte
+  readonly capabilities: CapabilitySet;
 }
 ```
 
-**Por que não `capabilities: IntegrationCapability[]` (enum array)?**
-Porque um enum array só diz *que existe* a capability, mas não te dá a implementação tipada. Você acabaria fazendo `registry.getCapability(provider, 'ORDERS') as OrderProvider` — um cast inseguro, exatamente o tipo de `if/switch` disfarçado que você quer evitar. Com `CapabilitySet` como objeto, `definition.capabilities.orders` já é `OrderCapability | undefined`, checável com type guard e sem cast.
+**Por que `CapabilitySet` objeto e não `capabilities: string[]`?**
+Porque enum array te obriga a `registry.getCapability(provider, 'ORDERS') as OrderCapability` — cast inseguro, o famoso `if/switch` disfarçado. Com `CapabilitySet`, `definition.capabilities.orders` já é `OrderCapability | undefined`, checável com type guard e sem cast. É o mesmo raciocínio que motivou o `types.enum.ts` do CRM, mas levado ao tipo da *implementação*, não ao rótulo.
 
-`IntegrationDefinition` é **puramente descritivo e estático** — não tem estado de tenant, não tem credenciais. É registrado uma vez no bootstrap do módulo do provider.
-
----
-
-## 5. Modelo `IntegrationInstance` (tenant)
+**`IntegrationInstance`** — continue seguindo o modelo do messaging `Instance`:
 
 ```typescript
-interface IntegrationInstance {
-  readonly id: string;
-  readonly tenantId: string;
-  readonly providerId: string;
-  readonly type: IntegrationType;
-  readonly credentialsRef: string;   // ponteiro para vault/secret manager, nunca o segredo cru no domínio
-  readonly config: Record<string, unknown>; // ex: { storeId, environment: 'production' }
-  readonly status: 'ACTIVE' | 'DISABLED' | 'ERROR';
-  readonly connectedAt: Date;
+export class IntegrationInstance {
+  id: string;
+  tenantId: string;                       // preenchido pelo PrismaRepository/MongoRepository
+  providerId: string;
+  credentialsRef: string;                 // ponteiro p/ vault — CriptoHelpers na porta, nunca cru no domínio
+  config: Record<string, unknown>;        // { storeId, environment: 'production' }
+  status: 'ACTIVE' | 'DISABLED' | 'ERROR';
 }
 ```
 
-A separação de `IntegrationDefinition` (o que Tray *pode fazer*) e `IntegrationInstance` (o que o tenant X *configurou* na Tray) é o que resolve o ponto 14 do enunciado. Fluxo de resolução real em runtime:
-
-```
-1. Webhook chega para providerId='tray'
-2. Registry resolve IntegrationDefinition('ECOMMERCE','tray') → adapters/capabilities
-3. Precisa achar QUAL tenant → geralmente via identificador no path
-   (ex: /integrations/tray/:tenantIntegrationId/webhooks) ou por
-   correlação com um campo do payload (store id da Tray) mapeado em IntegrationInstance
-4. Carrega IntegrationInstance (credenciais, config) daquele tenant
-5. Usa a capability da Definition + os dados da Instance para processar
-```
-
-Definition = **classe de comportamento** (singleton, injetado via DI).
-Instance = **dado de configuração** (linha de banco, carregado por repositório).
-Nunca misture os dois em uma única entidade "TrayIntegration" com estado de tenant embutido — isso é o erro mais comum em plataformas assim.
+Definition = **comportamento** (singleton, injetado via DI no bootstrap do módulo).
+Instance = **dado de configuração** (linha de banco, carregada por repositório).
+Nunca misture os dois numa entidade única com estado de tenant embutido.
 
 ---
 
-## 6. `providerId + integrationType` como chave de resolução
+## 5. Registry — o padrão que você já usa (token nomeado + resolver)
 
-Chave composta, tratada como **value object**, não como string concatenada manualmente:
+No DataCrazy, registry **não é** `Map` populado em `onModuleInit` — é a combinação de **token nomeado + `useFactory` de array + resolver** (megje `engines.providers.module.ts` e `integrations/integration.module.ts`). Replicar isso é a escolha certa, porque é o padrão que o time já entende e testa:
 
 ```typescript
-class IntegrationKey {
-  constructor(
-    readonly type: IntegrationType,
-    readonly providerId: string,
-  ) {}
-
-  toString(): string {
-    return `${this.type}:${this.providerId}`;
-  }
-
-  equals(other: IntegrationKey): boolean {
-    return this.type === other.type && this.providerId === other.providerId;
-  }
+// marketplace.providers.module.ts
+@Module({ /* imports: DataCrazyModule, ... */ })
+export class MarketplaceProvidersModule {
+  // Existem N implementações de IntegrationDefinition sob o mesmo token "INTEGRATIONS_MARKETPLACE"
 }
 ```
 
-Internamente o registry pode usar a string (`ECOMMERCE:tray`) como chave de `Map`, mas a API pública nunca aceita string crua — sempre `(type, providerId)` ou `IntegrationKey`, para o compilador pegar erros de digitação/domínio errado em tempo de build, não em runtime.
-
----
-
-## 7. Provider Registry
-
-Responsabilidade única: dado `(type, providerId)`, retornar a `IntegrationDefinition` (e, por extensão, suas capabilities tipadas). **Quem registra os providers?**
-
-Não é o registry que descobre os providers sozinho (nada de glob/reflection mágica — isso é implícito demais e quebra em builds). Cada módulo de provider **se registra explicitamente** no bootstrap, via um token de "multi-provider" do NestJS:
-
 ```typescript
-// integration-definition.token.ts
-export const INTEGRATION_DEFINITION = Symbol('INTEGRATION_DEFINITION');
-
-// tray.module.ts
-@Module({
-  providers: [
-    TrayAuthProvider,
-    TrayWebhookAdapter,
-    TrayOrderProvider,
-    {
-      provide: INTEGRATION_DEFINITION,
-      useFactory: (auth, webhook, orders) => ({
-        providerId: 'tray',
-        type: IntegrationType.ECOMMERCE,
-        displayName: 'Tray Commerce',
-        capabilities: { auth, webhook, orders },
-      }),
-      inject: [TrayAuthProvider, TrayWebhookAdapter, TrayOrderProvider],
-      multi: true,          // <- conceitual; Nest não tem `multi` nativo como Angular,
-    },                       //    ver nota abaixo sobre como emular isso
-  ],
-  exports: [INTEGRATION_DEFINITION],
-})
-export class TrayIntegrationModule {}
-```
-
-> **Nota importante:** o NestJS **não tem** `multi: true` nativo (isso é Angular). A forma correta de "providers múltiplos sob o mesmo token" em Nest é: cada módulo de provider expõe sua própria `IntegrationDefinition` com um token **próprio** (`TRAY_INTEGRATION_DEFINITION`), e um módulo agregador (`IntegrationRegistryModule`) injeta a lista inteira via um provider que depende de todos os tokens conhecidos, **ou** — abordagem mais escalável — cada módulo de provider chama `registry.register(definition)` no `onModuleInit()` (lifecycle hook do Nest), efeito colateral controlado e testável:
-
-```typescript
+// core/registry/marketplace.registry.ts
 @Injectable()
-export class IntegrationRegistry {
-  private readonly definitions = new Map<string, IntegrationDefinition>();
-
-  register(definition: IntegrationDefinition): void {
-    const key = new IntegrationKey(definition.type, definition.providerId).toString();
-    if (this.definitions.has(key)) {
-      throw new Error(`Integration ${key} already registered`);
-    }
-    this.definitions.set(key, definition);
-  }
+export class MarketplaceRegistry {
+  // injetado via @Inject("INTEGRATIONS_MARKETPLACE")
+  constructor(private readonly definitions: IntegrationDefinition[]) {}
 
   get(type: IntegrationType, providerId: string): IntegrationDefinition {
-    const key = new IntegrationKey(type, providerId).toString();
-    const def = this.definitions.get(key);
+    const def = this.definitions.find(
+      (d) => d.type === type && d.providerId === providerId,
+    );
     if (!def) throw new IntegrationNotFoundException(type, providerId);
     return def;
   }
 
   listByType(type: IntegrationType): IntegrationDefinition[] {
-    return [...this.definitions.values()].filter(d => d.type === type);
+    return this.definitions.filter((d) => d.type === type);
   }
 }
 ```
 
-```typescript
-// tray.module.ts
-@Module({ providers: [TrayAuthProvider, TrayWebhookAdapter, TrayOrderProvider] })
-export class TrayIntegrationModule implements OnModuleInit {
-  constructor(
-    private readonly registry: IntegrationRegistry,
-    private readonly auth: TrayAuthProvider,
-    private readonly webhook: TrayWebhookAdapter,
-    private readonly orders: TrayOrderProvider,
-  ) {}
+**`(type, providerId)` como chave composta** é decisão de design, não capricho: particiona o namespace por domínio (autorização "este tenant só habilita ECOMMERCE"), facilita roteamento de webhook e evita colisão de nome comercial entre domínios. Trate como value object `IntegrationKey`, nunca string concatenada manualmente.
 
-  onModuleInit() {
-    this.registry.register({
-      providerId: 'tray',
-      type: IntegrationType.ECOMMERCE,
-      displayName: 'Tray Commerce',
-      capabilities: { auth: this.auth, webhook: this.webhook, orders: this.orders },
-    });
+**Como adicionar um novo provider SEM tocar no core:**
+
+1. Criar `providers/<novo>/` com o módulo + capabilities que fizerem sentido.
+2. Adicionar a classe ao array do módulo provisionado pelo token `"INTEGRATIONS_MARKETPLACE"` (ex.: `const marketplaceIntegrations = [TrayIntegrationDefinition, YampiIntegrationDefinition, ...]` seguindo a convenção de `integrations` do CRM).
+3. Registrar o controller de webhook do provider em `MarketplaceWebhookController` — ou, melhor, um controller genérico que resolve via Registry (seção 8).
+4. **Zero linhas alteradas** em Registry, core, publisher, consumers.
+5. Se o provider tiver `eventType` novo sem handler, cai em `UnknownEventTypeException` → DLQ, sem quebrar ninguém (seguro por default).
+
+> **Trade-off vs. autorregistro via `onModuleInit`:** o padrão de array explícito do monorepo é melhor aqui — quem esquece de importar o módulo quebra em *compile-type*/*teste de integração*, não em runtime, e é consistente com `registerQueue`+`registerProcessor`. Mitigue com um teste que compara `registry.listByType()` contra uma lista esperada.
+
+---
+
+## 6. Modelo de dados (Prisma, seguindo o CRM)
+
+```prisma
+model MarketplaceIntegrationDefinition {
+  id          String   @id @default(uuid())
+  providerId  String
+  type        String
+  displayName String
+  capabilities Json     // snapshot pg para o catálogo (UI/admin); o comportamento é código
+  @@unique([type, providerId])
+}
+
+model MarketplaceIntegration {
+  id            String  @id @default(uuid())
+  tenantId      String
+  definitionRef String  // "ECOMMERCE:tray"
+  credentialsRef String
+  config        Json    @default("{}")
+  status        String  @default("ACTIVE")
+  @@index([tenantId, definitionRef])
+}
+```
+
+**Regras do monorepo que se aplicam aqui:**
+- `snake_case` com `@@map`/`@map`, `deletedAt` para soft-delete, ids uuid UI (convenção do `schema.prisma` do accounts/crm).
+- Repositório estende `PrismaRepository` — o `fixedWhere()` já força `{ tenantId, deletedAt: null }` e lança `InvalidTenantException` sem tenant.
+- Unsafe (`*UnsafeRepository`) **só** para o roteamento de webhook público (achar a instância do provider por `providerId`/`storeId` antes de ter tenant) — literalmente o que `findUnsafeInstancesByUserIdAndProvider` do messaging faz.
+
+---
+
+## 7. Envelope de eventos — adaptação do modelo DataCrazy
+
+O DataCrazy **não** tem um `IntegrationEvent<T>` genérico no padrão do documento original; o padrão real é `DomainEvent` + payload tipado + `@KafkaTopic` (`EcommerceWebhookKafkaEvent` é o exemplo). Recomendação: **adotar um envelope de integração explícito** em `libs/events/marketplace/`, porque o payload cru do provider + metadados de observabilidade não cabem bem no `DomainEvent` raquítico de hoje:
+
+```typescript
+// libs/events/marketplace/marketplace-webhook.event.ts
+export const MARKETPLACE_WEBHOOK_TOPIC = "marketplace.webhook.received";
+
+@KafkaTopic({ pool: { concurrency: 5 } })
+export class MarketplaceWebhookKafkaEvent extends DomainEvent {
+  constructor(public readonly data: MarketplaceWebhookEnvelope) {
+    super(data);
   }
 }
-```
 
-Essa é a abordagem recomendada: **cada módulo de provider é autocontido e se autorregistra**, e o `IntegrationRegistry` vive num módulo `@Global()` (`IntegrationCoreModule`) importado uma vez na raiz. Assim:
-
-- **Quem registra:** o próprio módulo do provider, no `onModuleInit`.
-- **Como o Nest injeta:** injeção normal por token/classe; o registry é um serviço `@Global()` singleton.
-- **Como o registry é construído:** incrementalmente, no bootstrap da aplicação, à medida que cada `XyzIntegrationModule` é importado no `AppModule`. Se o módulo não for importado, o provider simplesmente não existe — isso é uma feature (deploy seletivo de integrações por ambiente).
-- **Como evitar dependência circular:** o registry nunca importa módulos de provider. A dependência é sempre `ProviderModule → CoreModule (Registry)`, nunca o inverso. O registry não conhece Tray, Yampi ou Hotmart — só conhece a interface `IntegrationDefinition`.
-- **Como adicionar um novo provider sem alterar o core:** criar `NovoProviderModule`, implementar as capabilities que fizer sentido, chamar `registry.register()` no `onModuleInit`, importar o módulo em `EcommerceIntegrationModule` (ou domínio equivalente). Zero linha alterada em `IntegrationRegistry`, `WebhookController` ou Kafka consumer.
-- **Como testar:** `IntegrationRegistry` é uma classe pura sem I/O — testa-se com `new IntegrationRegistry()` e definitions mockadas, sem `TestingModule`. Testes de integração usam `Test.createTestingModule({ imports: [TrayIntegrationModule] })` e verificam `registry.get(ECOMMERCE, 'tray')` retorna as capabilities esperadas.
-
----
-
-## 8. Estratégia de DI do NestJS (visão consolidada)
-
-| Mecanismo | Uso na plataforma |
-|---|---|
-| **Injection tokens (`Symbol`/classe abstrata)** | Ports do core: `EVENT_PUBLISHER`, `IDEMPOTENCY_STORE`, `CREDENTIAL_VAULT`. Nunca importe a implementação concreta (KafkaEventPublisher) fora do módulo de infra. |
-| **Abstract classes** | Preferidas a `interface` quando o token *é* a própria classe (evita duplicar `Symbol` + `interface`), ex.: `abstract class OrderProvider { abstract getOrder(id: string): Promise<CanonicalOrder>; }`. Facilita autocomplete e `useClass` no DI sem token string. |
-| **`@Global()` module** | `IntegrationCoreModule` (registry, idempotency, envelope factory) — importado 1x, usado em todo lugar sem reimportar. |
-| **Dynamic Modules (`forRoot`/`forFeature`)** | Módulos de infraestrutura configuráveis por ambiente: `KafkaModule.forRoot({ brokers, clientId })`, `IntegrationAuthenticationModule.forFeature({ vaultProvider })`. **Não** use dynamic module para os providers de negócio (Tray, Yampi) — eles não têm configuração estrutural variável, são módulos estáticos simples. |
-| **Factories (`useFactory`)** | Montagem de `IntegrationDefinition` a partir de providers já injetados (seção 7) e construção de clients HTTP configurados por instance (seção 13). |
-| **Lifecycle hooks** | `onModuleInit` para autorregistro no registry; `onApplicationShutdown` para fechar producers Kafka graciosamente. |
-| **Scopes** | Providers de negócio ficam `DEFAULT` (singleton). Evite `REQUEST` scope no core — mata performance em alto throughput de Kafka consumer; carregue tenant/instance explicitamente por parâmetro, não via scoped injection. |
-
----
-
-## 9. Arquitetura de Webhook
-
-**Camadas — respondendo diretamente à pergunta do enunciado:**
-
-| Componente | Camada |
-|---|---|
-| `WebhookController` | Infrastructure (HTTP) |
-| `WebhookRouter` (resolve provider a partir da URL) | Application/Core — usa o Registry |
-| `WebhookAdapter` (verify signature, parse, identify, normalize) | **Port** = interface no core; **Adapter** = implementação por provider (infra do provider) |
-| `IdempotencyStore` | Port no core / implementação Redis-Postgres na infra |
-| `EventPublisher` | Port no core / implementação Kafka na infra |
-| `IntegrationEventHandler` (consumer-side) | Application |
-| `TrayOrderMapper` etc. | Adapter (provider-specific), mas invocado pela Application |
-| `Application Service` / `Domain` | Domain puro, sem NestJS, sem Kafka, sem HTTP |
-
-**Pipeline HTTP (deve ser rápido — meta: p99 < 100ms, nada de chamar API externa aqui):**
-
-```typescript
-abstract class WebhookAdapter<TRaw = unknown> {
-  abstract verifySignature(req: RawWebhookRequest): boolean;
-  abstract parse(req: RawWebhookRequest): TRaw;
-  abstract identifyEventType(payload: TRaw): string;
-  abstract extractIdempotencyKey(payload: TRaw): string;
-  abstract toEnvelopePayload(payload: TRaw): unknown; // normalização mínima, não mapeamento completo
-}
-```
-
-Fluxo no `WebhookController`:
-
-```
-1. Resolve IntegrationDefinition via Registry (type vem da rota, providerId vem da rota)
-2. Se não existe .capabilities.webhook → 404
-3. adapter.verifySignature() → se falso, 401, NÃO publica no Kafka
-4. adapter.parse() → se erro de estrutura mínima, 400, NÃO publica
-5. idempotencyKey = adapter.extractIdempotencyKey()
-6. Se já existe no IdempotencyStore (check rápido, TTL curto) → 200 idempotente, sem republicar
-7. envelope = EnvelopeFactory.create(...)
-8. publisher.publish(topic, envelope)   // fire-and-forget com ack síncrono do broker
-9. return 200 imediatamente
-```
-
-O **mapeamento completo** para o modelo canônico (Order, Customer) **não acontece aqui** — acontece no consumer, de forma assíncrona. O que sai do HTTP endpoint é o payload cru (ou levemente normalizado) dentro do envelope, não o `CanonicalOrder` já mapeado. Isso é proposital: mapear tudo no HTTP path aumenta latência e acopla o tempo de resposta do webhook à complexidade de mapeamento, que deveria ser sempre assíncrona e retry-ável.
-
----
-
-## 10. Arquitetura Kafka
-
-**Ports no core, implementação na infra:**
-
-```typescript
-abstract class EventPublisher {
-  abstract publish<T>(topic: string, event: IntegrationEvent<T>, key?: string): Promise<void>;
-}
-
-abstract class IdempotencyStore {
-  abstract has(key: string): Promise<boolean>;
-  abstract markProcessed(key: string, ttlSeconds: number): Promise<void>;
-}
-```
-
-`KafkaModule` (dynamic module, `forRoot`) implementa essas abstrações com `@nestjs/microservices` + KafkaJS por baixo, e é a única parte do sistema que sabe o que é um "tópico Kafka" de fato. O `WebhookController` e o `IntegrationEventHandler` só conhecem `EventPublisher`/`EventConsumer` — trocar para SQS/RabbitMQ no futuro é uma troca de módulo de infra, não uma reescrita do core.
-
-**Consumer:** um `@Controller()` de microservice Nest (`@EventPattern`) por família de tópico, delegando para `IntegrationEventHandler`, que resolve o handler específico do provider via Registry — mesma lógica, sem `if/switch`:
-
-```typescript
-@Injectable()
-export class IntegrationEventHandler {
-  constructor(private readonly registry: IntegrationRegistry) {}
-
-  async handle(envelope: IntegrationEvent<unknown>): Promise<void> {
-    const def = this.registry.get(envelope.integrationType, envelope.providerId);
-    const handler = def.capabilities.webhook?.getEventHandler(envelope.eventType);
-    if (!handler) throw new UnknownEventTypeException(envelope);
-    await handler.handle(envelope);
-  }
-}
-```
-
----
-
-## 11. Kafka Event Envelope
-
-Sua proposta inicial está quase certa. Crítica campo a campo:
-
-| Campo | Manter? | Justificativa |
-|---|---|---|
-| `eventId` | ✅ | Identidade única do evento publicado (não confundir com idempotencyKey do webhook original). |
-| `tenantId` | ✅ | Obrigatório — sem ele, nenhum consumer sabe de quem é o dado. |
-| `providerId` | ✅ | Necessário para resolver o Registry no consumer. |
-| `integrationType` | ✅ | Idem — chave composta de resolução. |
-| `eventType` | ✅ | Ex.: `order.created`. Deve ser um valor **canônico da plataforma**, não o nome cru do provider (`novo_pedido`), para permitir roteamento e handlers genéricos por tipo. |
-| `correlationId` | ✅ **adicionar** | Rastreia uma cadeia de eventos relacionados (ex.: webhook → order.created → order.enriched → notification.sent) através de múltiplos tópicos/serviços. Essencial para observabilidade distribuída. |
-| `causationId` | ✅ **adicionar** | Aponta o `eventId` do evento que causou este (diferente de correlation, que agrupa; causation é o "pai" direto). Importante para debugar cascatas de eventos e para replay seletivo. |
-| `idempotencyKey` | ✅, mas repense o escopo | Deve ser **derivada de forma determinística do provider** (ex.: hash de `providerId + externalEventId`), não gerada aleatoriamente — senão reprocessar o mesmo webhook (retry do provider) gera uma chave diferente e a idempotência não funciona. |
-| `occurredAt` | ✅ | Timestamp de quando o evento **aconteceu no provider** (se disponível no payload) — pode ser diferente de `receivedAt`. |
-| `receivedAt` | ✅ **adicionar** | Timestamp de quando a plataforma recebeu o webhook. A diferença entre os dois mede atraso do provider e é métrica operacional valiosa. |
-| `version` | ✅ **adicionar** | Versão do *schema do envelope* (`1`) — não confundir com versão do payload (ver `metadata.schemaVersion` abaixo). Permite consumers antigos rejeitarem/adaptarem envelopes de formato novo. |
-| `metadata` | ✅ **adicionar**, mas com propósito definido | Espaço para dados **operacionais**, não de negócio: `schemaVersion` do payload, `sourceIp`, `retryCount`, `traceId` (OpenTelemetry). Nunca colocar regra de negócio aqui. |
-| `payload` | ✅ | Dado específico do evento — **tipado por `eventType`**, não um blob genérico. |
-
-**Envelope final recomendado:**
-
-```typescript
-interface IntegrationEvent<T> {
+export interface MarketplaceWebhookEnvelope {
   eventId: string;
-  eventType: string;              // 'ecommerce.order.created'
+  eventType: string;              // canônico: 'ecommerce.order.created' (não o nome cru do provider)
   version: number;                // versão do envelope, não do payload
-
   tenantId: string;
   integrationType: IntegrationType;
   providerId: string;
-
   correlationId: string;
   causationId?: string;
-  idempotencyKey: string;
-
-  occurredAt: string;             // ISO — quando aconteceu no provider
-  receivedAt: string;             // ISO — quando a plataforma recebeu
-
+  idempotencyKey: string;         // hash determinístico (providerId + externalEventId)
+  occurredAt: string;             // quando aconteceu no provider
+  receivedAt: string;             // quando a plataforma recebeu
   metadata: {
-    schemaVersion: number;        // versão do payload/contrato
+    schemaVersion: number;
     traceId?: string;
     retryCount?: number;
+    rawPayloadRef?: string;       // blob store, nunca JSON gigante na mensagem
   };
+  payload: Record<string, unknown>; // tipado por evento no consumer
+}
 
-  payload: T;
+export function createMarketplaceWebhookEvent(
+  payload: MarketplaceWebhookEnvelope,
+): MarketplaceWebhookKafkaEvent {
+  return new MarketplaceWebhookKafkaEvent(payload);
 }
 ```
 
-**O que fica no payload, não no envelope:** tudo que é específico do domínio/recurso — `orderId`, `items`, `customer`, `total`. O envelope é infraestrutura de mensageria; o payload é o dado de negócio, e deve seguir o **modelo canônico** do recurso (seção 15), não o formato cru do provider (esse fica preservado, se necessário, em `metadata.rawPayloadRef` apontando para um blob store, nunca dentro do evento — mensagens Kafka devem ser pequenas).
+Pontos que a experiência DataCrazy valida:
+- **`correlationId`/`causationId`**: cobrem a cadeia webhook → order.created → flow trigger (exatamente o caminho `EcommerceWebhookKafkaEvent` → `TrayIntegrationEventHandler` → `TrayIntegrationTrigger`).
+- **`idempotencyKey` determinística**: reprocessar o mesmo webhook do provider (retry) gera a **mesma** chave — senão a idempotência não funciona. Compõe com `DistributedLockService.executeWithLock(idempotencyKey)` no consumer e com o dedup do `QueueManager`.
+- **`sessionContext`**: o `EventsPubSub.publish()` injeta `event["sessionContext"]` automaticamente — o consumer restaura via `EventHandler`. Mantenha `sessionContext` fora do `data` tipado; ele é infraestrutura do barramento.
+
+**Tópicos** (dois níveis, granularidade `domain.resource.event`, nunca por provider):
+
+```
+marketplace.webhook.received                  # entrada crua (opcional; só se o parsing for pesado)
+marketplace.ecommerce.order.created
+marketplace.ecommerce.order.updated
+marketplace.ecommerce.customer.created
+marketplace.infoproduct.sale.created
+marketplace.infoproduct.subscription.cancelled
+marketplace.payment.charge.succeeded
+```
+
+- Particionar por `tenantId` (ordering por tenant garantido — é o que importa). Nunca por `eventId` nem por `providerId`.
+- Consumer groups por responsabilidade de negócio (`order-sync-service`, `notification-service`), não por provider.
+- Retry local (padrão `EventHandler`, 3 tentativas) → DLQ após exceder (padrão `dead.letter.event.ts`/`failed-event-recovery`).
+- Evolução: `metadata.schemaVersion`; mudança aditiva não incrementa, breaking exige versão nova.
 
 ---
 
-## 12. Estratégia de Topics
+## 8. Arquitetura de Webhook (o padrão que o monorepo já repete em N providers)
 
-Nem `integrations.webhooks` genérico demais (perde ordering e tipagem por consumer), nem granularidade extrema por provider (`integration.tray.order.created`, `integration.yampi.order.created` — explode o número de tópicos sem necessidade, já que o consumer deveria ser agnóstico a provider).
-
-**Recomendação: dois níveis.**
-
-```
-integration.webhook.received                  ← raw, por domínio ou único? ver abaixo
-integration.<domain>.<resource>.<event>        ← canônico, pós-processamento
-```
-
-```
-integration.webhook.received                    # entrada única, partição por (tenantId+providerId)
-integration.ecommerce.order.created
-integration.ecommerce.order.updated
-integration.ecommerce.customer.created
-integration.infoproduct.sale.created
-integration.infoproduct.subscription.cancelled
-integration.payment.charge.succeeded
-```
-
-- **Granularidade por `domain.resource.event`**, não por provider. O consumer de `integration.ecommerce.order.created` não deveria se importar se veio de Tray ou Yampi — o Registry já resolveu isso antes de publicar o evento canônico.
-- **`integration.webhook.received`** é o único tópico "cru" (opcional — só necessário se você quiser desacoplar totalmente o parsing/validação inicial do mapeamento canônico em dois consumers distintos; se o adapter já consegue normalizar rápido o suficiente no HTTP handler, pode publicar direto nos tópicos canônicos e eliminar esse tópico intermediário — decisão de trade-off latência vs. desacoplamento, não uma regra fixa).
-- **Particionamento:** chave de partição = `tenantId` (ou `tenantId:providerId` se um tenant tiver múltiplas instâncias do mesmo provider) — garante ordering por tenant, que é o que importa (dois eventos do mesmo pedido, do mesmo tenant, nunca podem ser processados fora de ordem). Nunca particione por `eventId` (aleatório, perde ordering) nem por `providerId` sozinho (concentra tenants grandes numa partição só, "hot partition").
-- **Ordering:** garantida só dentro da partição. Se um `eventType` precisar de ordering causal (ex.: `order.created` antes de `order.updated`), a chave de partição (`tenantId`) já resolve, desde que ambos venham do mesmo tenant — o que é sempre o caso.
-- **Consumer groups:** um group por *responsabilidade de negócio*, não por provider. Ex.: `order-sync-service`, `notification-service`, `analytics-ingestion` — todos consomem `integration.ecommerce.order.created`, cada um com seu próprio group, processamento independente.
-- **Retry:** retry local (in-memory, com backoff exponencial, 3-5 tentativas) para falhas transitórias (timeout de HTTP, deadlock de DB). Depois disso, **DLQ**.
-- **DLQ:** um tópico DLQ por tópico de origem (`integration.ecommerce.order.created.dlq`), preservando o envelope original + motivo da falha + stacktrace resumido em `metadata`. Processo manual/automatizado de replay a partir da DLQ.
-- **Replay:** possível porque o envelope é autocontido e determinístico (mesma `idempotencyKey`) — reprocessar não duplica efeito, graças ao idempotency check na aplicação (não só no webhook HTTP — o consumer também deve checar, porque Kafka garante *at-least-once*, não *exactly-once*).
-- **Versionamento/evolução:** `metadata.schemaVersion` no payload. Mudanças **aditivas** (novo campo opcional) não incrementam a versão. Mudanças **breaking** (remover/renomear campo) exigem versão nova e, idealmente, o mapper publica ambas as versões durante o período de transição, ou os consumers leem por schema registry (Avro/Protobuf, se o volume justificar — para começar, JSON com `schemaVersion` explícito é suficiente e mais simples).
-
----
-
-## 13. Estratégia de Autenticação (composição, não capability única)
-
-```
-AuthenticationStrategy (port)
-  ├── OAuth2Strategy
-  ├── OAuth2PkceStrategy
-  ├── ApiKeyStrategy
-  ├── BearerTokenStrategy
-  ├── BasicAuthStrategy
-  ├── ClientCredentialsStrategy
-  └── ProprietaryStrategy (por provider, quando nada acima serve)
-```
+O esqueleto de todo webhook público do DataCrazy é o mesmo; o marketplace deve **copiá-lo**, não reinventar:
 
 ```typescript
-abstract class AuthenticationStrategy {
+abstract class WebhookAdapter<TRaw = unknown> {
+  abstract verifySignature(req: RawWebhookRequest): boolean;      // timingSafeEqual/HMAC — varia por provider
+  abstract parse(req: RawWebhookRequest): TRaw;
+  abstract identifyEventType(payload: TRaw): string;              // 'novo_pedido' → 'order.created'
+  abstract extractIdempotencyKey(payload: TRaw): string;
+  abstract toEnvelopePayload(payload: TRaw): unknown;             // normalização mínima, NÃO mapeamento completo
+}
+```
+
+Controller genérico (rota por domínio, loga cada passo em `IntegrationLog` — como o CRM faz):
+
+```typescript
+@Controller("webhooks/:integrationType/:providerId")  // fora do prefixo? ver main.ts
+export class MarketplaceWebhookController {
+  // @Public() + @WebhookThrottler() — como todo webhook do monorepo
+  constructor(
+    private readonly registry: MarketplaceRegistry,
+    private readonly lock: DistributedLockService,
+    private readonly logRepository: IntegrationLogRepository,   // ou no handler
+  ) {}
+
+  @Post()
+  async receive(
+    @Param("integrationType") type: IntegrationType,
+    @Param("providerId") providerId: string,
+    @Req() req: RawWebhookRequest,
+  ) {
+    const def = this.registry.get(type, providerId);
+    const webhook = def.capabilities.webhook;
+    if (!webhook) throw new NotFoundException();
+
+    if (!webhook.adapter.verifySignature(req)) throw new UnauthorizedException();
+
+    const raw = webhook.adapter.parse(req);
+    const idempotencyKey = webhook.adapter.extractIdempotencyKey(raw);
+
+    // achar o tenant: via identificador na URL (:tenantId) ou correlação
+    // payload→instância (findUnsafeInstancesByUserIdAndProvider do messaging)
+    return this.lock.executeWithLock(idempotencyKey, () =>
+      this.enqueue(envelope, raw),
+    );
+    // retorna 200 idempotente se já processado
+  }
+}
+```
+
+**Pipeline extremamente importante — o que NÃO fazer no path HTTP (meta p99 < 100ms):**
+- Não mapear para canonical model aqui. O que sai do HTTP é o payload **cru/levemente normalizado** dentro do envelope. Mapeamento completo é assíncrono, no consumer, retry-ável.
+- Não chamar API externa no HTTP path.
+- Verificação de assinatura falhou → **não publica, não enfileira** → `401`.
+- Redis/lock indisponível → `503` e o provider fará retry.
+
+O XML/JSON assinatura detalhada de cada provider (a assinatura secreta no header `X-Signature`, token estático, HMAC-SHA256) é **implementação do adapter** — o pipeline é compartilhado; só o `verifySignature`/`parse` varia. O `universal-connection` já é um exemplo de provider que faz esse pipeline **config-driven** (`receive.signatureHeader + algorithm sha256/sha1/hmac-sha256/static`) — pode ser a base do "conector genérico" do marketplace (seção 14).
+
+---
+
+## 9. Consumidor do marketplace (filas + eventos)
+
+Dois mecanismos do monorepo se encaixam aqui, por throughput e criticidade:
+
+1. **Envelope leve → Kafka** (`MarketplaceWebhookKafkaEvent`): para eventos tipados que outros microserviços consomem (flow do CRM se inscreve em `marketplace.ecommerce.order.created`).
+2. **Processamento pesado/retry-ável → BullMQ** (`QueueModule.registerQueue("marketplace-webhook-messages")` + `registerProcessor(SeuProcessor)`): para mapear canonical model, persistir, notificar — com `QueueProcessor` restaurando `sessionContext` de `QueueData`.
+
+```typescript
+// processor
+@Processor("marketplace-webhook-messages", { concurrency: 10 })
+export class MarketplaceWebhookProcessor extends QueueProcessor<MarketplaceWebhookEnvelope> {
+  // QueueProcessor já restaura o context de sessão do job.data.sessionContext
+  async execute(data: MarketplaceWebhookEnvelope): Promise<void> {
+    await this.lock.executeWithLock(data.idempotencyKey, () =>
+      this.handler.handle(data),
+    );
+  }
+}
+```
+
+Tudo que o consumer precisa já vem no envelope (`tenantId`, `integrationType`, `providerId`, `eventType`) — igual o `EventHandler` do CRM resolve `EcommerceWebhookKafkaEvent` → `TrayIntegrationTrigger`.
+
+---
+
+## 10. Idempotência — sem reinventar
+
+Hoje o monorepo tem idempotência **de curta duração** embutida (`QueueManager` dedup + lock `executeWithLock`). Para webhook/evento de marketplace, a recomendação é:
+
+- **Camada 1 (HTTP):** `executeWithLock("webhook:" + idempotencyKey, ...)` — não republica/enfileira o mesmo webhook.
+- **Camada 2 (consumer):** lock + checar "já processado" na aplicação, porque Kafka/filas garantem *at-least-once*, não *exactly-once*. Uma column `processedKey`/marcador na `IntegrationLog` serve (ou `markProcessed` com TTL num `IdempotencyStore` se o volume justificar).
+
+Não crie um framework de idempotência; **crie a porta** (`abstract IdempotencyStore`) e deixe a implementação seguir em `KafkaIdempotencyStore`/prisma como *infra* — exatamente o estilo `IdempotencyStore` do documento original, mas plugado no `DistributedLockService` que já existe.
+
+---
+
+## 11. Autenticação — por Strategy (composição), não herança
+
+Hoje o OAuth vive **duplicado** (tray, whatsapp-cloud, facebook-leadgen, google-calendar). O marketplace paga esse débito promovendo strategies genéricas para `libs/shared`:
+
+```typescript
+// libs/shared/src/integration-auth/strategies/authentication.strategy.ts
+export abstract class AuthenticationStrategy {
   abstract getAuthorizationHeaders(instance: IntegrationInstance): Promise<Record<string, string>>;
   abstract refresh?(instance: IntegrationInstance): Promise<CredentialSet>;
 }
+
+// strategies concretas, reutilizáveis entre providers
+export class OAuth2Strategy extends AuthenticationStrategy { /* config: authorizationUrl, tokenUrl, clientId, clientSecret, scopes */ }
+export class OAuth2PkceStrategy extends AuthenticationStrategy {}
+export class ApiKeyStrategy extends AuthenticationStrategy {}
+export class ClientCredentialsStrategy extends AuthenticationStrategy {}
+export class BasicAuthStrategy extends AuthenticationStrategy {}
 ```
 
-- **Strategy pattern puro** para o mecanismo de auth (OAuth2, ApiKey etc.) — reutilizável entre providers: Yampi e Shopify podem ambos usar `OAuth2Strategy`, configurados de forma diferente (endpoints, scopes).
-- **Configuração**, não código novo, é o que diferencia Yampi de Shopify dentro do mesmo `OAuth2Strategy`: `{ authorizationUrl, tokenUrl, clientId, clientSecret, scopes }` injetado via `useFactory` a partir de config do módulo do provider.
-- **Adapter** só é necessário quando o provider tem um fluxo verdadeiramente proprietário (assinatura HMAC customizada em vez de Bearer padrão) — nesse caso, uma implementação própria de `AuthenticationStrategy` (não uma nova abstração no core).
-- **Port**: `AuthenticationStrategy` é a interface abstrata em si — vive no core, providers implementam ou reutilizam as strategies genéricas.
-- **Credential storage** é um `Port` separado (`CredentialVault`), nunca dentro da strategy — a strategy pede/recebe credenciais, não as persiste.
-- Cada `IntegrationDefinition.capabilities.auth` referencia **qual strategy** aquele provider usa, e a instância de config vem do módulo do provider:
-
-```typescript
-// tray.module.ts (trecho)
-{
-  provide: TrayAuthProvider,
-  useFactory: (httpClient) => new OAuth2Strategy(httpClient, {
-    authorizationUrl: 'https://accounts.tray.com.br/oauth/authorize',
-    tokenUrl: 'https://accounts.tray.com.br/oauth/token',
-  }),
-  inject: [HTTP_CLIENT],
-}
-```
-
-Refresh de token: tratado dentro da própria strategy (`refresh()`), chamado automaticamente por um interceptor de HTTP client compartilhado quando a API retorna 401 — **isso é core reutilizável**, não reimplementado por provider.
+- Yampi e Shopify usam **a mesma** `OAuth2Strategy`, configurada diferente (`useFactory` a partir do módulo do provider) — zero código novo de auth.
+- Provider com fluxo proprietário (HMAC custom) → implementa `AuthenticationStrategy` propria, sem nova abstração no core.
+- **Refresh automático de token** no provider (tray já faz: `TrayAuthenticatorService` + `ExecuteWithFreshTokenCommandHandler`) é candidato a virar **core reutilizável**: um interceptor/"fresh-token" executor compartilhado, não reimplementado por provider.
+- **Credenciais** criptografadas com `CryptoHelpers` e guardadas via uma **porta `CredentialVault`** (hoje o acesso é espalhado em cache/fields). A strategy pede credenciais, não as persiste.
 
 ---
 
-## 14. Estratégia de Capabilities
-
-Capability = **par (porta tipada, implementação opcional)**. O core nunca pergunta "esse provider suporta X" através de enum — pergunta através de `definition.capabilities.x !== undefined`, e o TypeScript já garante o tipo certo depois do check.
+## 12. Capabilities — par (porta tipada, implementação opcional)
 
 ```typescript
-abstract class OrderCapability {
+// core/capabilities/order-capability.ts
+export abstract class OrderCapability {
   abstract getOrder(instance: IntegrationInstance, externalId: string): Promise<CanonicalOrder>;
   abstract listOrders(instance: IntegrationInstance, filter: OrderFilter): Promise<Page<CanonicalOrder>>;
 }
 
-abstract class WebhookCapability {
-  abstract readonly adapter: WebhookAdapter;
+// core/capabilities/webhook-capability.ts
+export abstract class WebhookCapability {
+  abstract adapter: WebhookAdapter;
   abstract getEventHandler(eventType: string): EventHandler | undefined;
 }
 ```
 
-Cada capability é uma abstract class/interface pequena e focada (ver seção 12/16 do enunciado sobre evitar interfaces gigantes — detalhado a seguir). O ponto central: **capability não é herança, é presença opcional em um slot tipado do `CapabilitySet`.** Um provider que não suporta `refunds` simplesmente não preenche esse slot — código consumidor faz `if (def.capabilities.refunds) {...}`, sem exception, sem cast, sem enum flag desacoplada da implementação.
+Capability **não é herança nem enum flag** — é presença opcional num slot tipado do `CapabilitySet`. Quem não suporta `refunds` simplesmente não preenche o slot; o consumidor faz `if (def.capabilities.refunds) {...}` — igual ao messaging decide "qual engine" via resolver, mas com tipo garantido pelo compilador.
 
 ---
 
-## 15. Estratégia de Canonical Models
+## 13. Canonical Models — o item de maior valor do marketplace
 
-**Quando criar canonical model:** quando o recurso é (a) consultado/cruzado por múltiplos consumers agnósticos a provider (ex.: um dashboard financeiro que soma `Order.total` de Tray + Yampi), ou (b) publicado como evento de domínio que outros serviços vão consumir sem saber de onde veio.
+**Quando criar:** o recurso é (a) consultado/cruzado por consumers agnósticos a provider (dashboard financeiro somando `Order.total` de Tray + Yampi), ou (b) publicado como evento que outros serviços consomem sem saber a origem.
 
-**Quando NÃO criar:** para dados que só fazem sentido dentro do fluxo daquele provider específico e nunca são cruzados (ex.: metadados de configuração de loja da Tray). Nesse caso, deixe o dado no payload cru/específico, sem forçar um campo canônico vazio.
+**Quando NÃO criar:** dados que só fazem sentido no fluxo do provider e nunca são cruzados — deixe no payload cru, no `providerData`, não force campo canônico vazio.
 
-**Quem faz o mapping:** o **Mapper** do provider (`TrayOrderMapper`, `YampiOrderMapper`) — parte do módulo do provider, nunca do core. O core define o **shape** do `CanonicalOrder` (contrato); o provider é responsável por preenchê-lo.
-
-**Onde o mapping fica:** na camada de Application/Adapter do provider, chamado pelo `IntegrationEventHandler` genérico do core, nunca dentro do core em si.
+**Onde fica o mapping:** no **Mapper do provider** (`tray-order.mapper.ts`), parte do módulo do provider, invocado pelo handler genérico — nunca no core. O core só define o shape do contrato.
 
 ```typescript
-abstract class OrderMapper<TRaw> {
-  abstract toCanonical(raw: TRaw): CanonicalOrder;
-}
-```
-
-**Campos sem equivalência entre providers:** vivem em `CanonicalOrder.providerData: Record<string, unknown>` (ou, melhor tipado, `providerData: unknown` com o tipo real conhecido só pelo próprio provider) — um "escape hatch" explícito, não um `any` disfarçado no meio dos campos canônicos. Isso evita o "lowest common denominator": o canonical model carrega os campos que **de fato têm equivalência semântica** (id, status, total, items, customer), e tudo mais fica acessível, mas fora do contrato principal.
-
-```typescript
-interface CanonicalOrder {
+// ecommerce/domain/canonical-order.ts
+export interface CanonicalOrder {
   externalId: string;
   tenantId: string;
   providerId: string;
-  status: CanonicalOrderStatus;   // enum canônico, com mapeamento de status próprio por provider
+  status: CanonicalOrderStatus;       // enum canônico com mapeamento de status por provider
   total: Money;
   items: CanonicalOrderItem[];
   customer: CanonicalCustomerRef;
   createdAt: Date;
   updatedAt: Date;
-  providerData?: unknown;          // dados específicos não canonicalizados, tipados no adapter do provider
+  providerData?: unknown;             // escape hatch explícito, tipado no adapter do provider
 }
 ```
 
-**Comportamentos muito diferentes entre providers** (ex.: Hotmart tem "sale" com conceito de comissão de afiliado que não existe em e-commerce): **não force no canonical model genérico**. Isso é sinal de que o recurso pertence a um **sub-tipo de domínio diferente** (`CanonicalSale` ≠ `CanonicalOrder`, mesmo que ambos "sejam uma venda"). Forçar um modelo único para os dois é exatamente o "lowest common denominator artificial" que você quer evitar — tenha dois modelos canônicos, um por domínio, cada um fiel à semântica do seu domínio.
+`providerData` é o antídoto contra o "lowest common denominator": o modelo carrega o que tem equivalência semântica real; o resto fica acessível, mas fora do contrato. E o erro de "forçar Hotmart sale virar Order" é o mesmo de sempre: são **dois domínios** (`CanonicalSale` com comissão de afiliado ≠ `CanonicalOrder`), com modelos canônicos próprios — não force um modelo único.
 
 ---
 
-## 16. Estrutura de módulos NestJS
+## 14. O "conector genérico" — herança do `universal-connection`, não um DSL novo
+
+O messaging já tem o blueprint do conector universal: `UniversalConnectionConfig { send, receive, auth, credentials }` — endpoints declarativos, `responseMapping`, `retry`, validação de assinatura configurável, log completo de request/response com mascaramento de header.
+
+Para o marketplace, o movimento certo é:
+
+- **Não fazer** um "GenericProvider universal" que tenta REST/GraphQL/SOAP/polling ao mesmo tempo.
+- **Fazer** o provider genérico apenas para o *perfil de integração* mais comum (webhook de eventos + fetch por API de recurso com auth padronizado), **config-driven** como o universal-connection — útil para o "long tail" de integrações que um parceiro liga sem escrever código.
+- Todo resto continua com `ApiClient` próprio por provider sobre o `HttpModule` compartilhado (retry/circuit-breaker/refresh de token).
+
+Regra prática: **construa a abstração config-driven depois de ver o padrão se repetir 3x**, não antes (o próprio universal-connection só nasceu depois de N providers de mensageria).
+
+---
+
+## 15. Estrutura de módulos proposta (no novo microserviço `marketplace`)
+
+Convenção `domain/ application/ infra/` + registro centralizado (padrão CRM/AGENTS.md):
 
 ```
 src/
-  integrations/
-    core/                                # NUNCA importa nada de providers/domínios
+  marketplace/
+    core/                                    # NUNCA importa provider
       registry/
-        integration-registry.ts
+        marketplace.registry.ts
         integration-key.ts
         integration-not-found.exception.ts
       capabilities/
         order-capability.ts
         webhook-capability.ts
-        auth-capability.ts (abstract AuthenticationStrategy)
-        customer-capability.ts
         product-capability.ts
+        customer-capability.ts
+        sale-capability.ts
+        auth-capability.ts                   # abstract AuthenticationStrategy
       events/
-        integration-event.envelope.ts
-        event-publisher.port.ts
-        event-consumer.port.ts
-        idempotency-store.port.ts
+        marketplace.envelope.ts
+        idempotency-store.port.ts            # implementação: DistributedLockService/prisma
       credentials/
-        credential-vault.port.ts
-      integration-core.module.ts         # @Global(), exporta Registry, ports
-
-    kafka/                                # infra — implementa os ports do core
-      kafka.module.ts                     # dynamic module forRoot({ brokers })
-      kafka-event-publisher.ts
-      kafka-idempotency-store.ts
-
-    webhooks/
-      webhook.controller.ts               # HTTP edge
-      webhook-router.ts                   # resolve provider via Registry
-      webhook-adapter.port.ts             # abstract WebhookAdapter (fica em core/capabilities, ok referenciar)
-      integration-webhook.module.ts
-
-    authentication/
-      strategies/
-        oauth2.strategy.ts
-        oauth2-pkce.strategy.ts
-        api-key.strategy.ts
-        client-credentials.strategy.ts
-        basic-auth.strategy.ts
-      http-client-factory.ts              # client HTTP com interceptor de refresh automático
-      integration-authentication.module.ts
+        credential-vault.port.ts             # implementação: CryptoHelpers + fields/cache
+      marketplace-core.module.ts             # @Global() via DataCrazyModule pattern
 
     ecommerce/
-      domain/
-        canonical-order.ts
-        canonical-customer.ts
-        canonical-product.ts
-      application/
-        order-event.handler.ts            # genérico, resolve mapper via Registry
-        ecommerce-integration.module.ts    # importa os módulos de cada provider
+      domain/ canonical-order.ts canonical-customer.ts canonical-product.ts
+      application/ order-event.handler.ts ecommerce-integration.module.ts
       providers/
         tray/
           tray.module.ts
-          tray-auth.provider.ts
-          tray-webhook.adapter.ts
-          tray-order.provider.ts
-          tray-order.mapper.ts
-          tray-api.client.ts
-        yampi/
-          yampi.module.ts
-          yampi-auth.provider.ts
-          yampi-webhook.adapter.ts
-          yampi-order.provider.ts
-          yampi-order.mapper.ts
-          yampi-api.client.ts
-
+          tray.definition.ts                 # monta CapabilitySet + registry token
+          tray.auth.strategy.ts              # OAuth2Strategy configurada
+          tray.webhook.adapter.ts
+          tray.order.provider.ts
+          tray.order.mapper.ts
+          tray.api.client.ts
+        yampi/ ...
     infoproduct/
-      domain/
-        canonical-sale.ts
-      application/
-        sale-event.handler.ts
-        infoproduct-integration.module.ts
-      providers/
-        hotmart/
-          hotmart.module.ts
-          hotmart-auth.provider.ts
-          hotmart-webhook.adapter.ts
-          hotmart-sale.provider.ts
-          hotmart-sale.mapper.ts
+      domain/ canonical-sale.ts
+      application/ sale-event.handler.ts infoproduct-integration.module.ts
+      providers/hotmart/ ...
 
-  integrations.module.ts                  # agrega tudo, importado no AppModule
+  marketplace.module.ts                      # agrega, importa DataCrazyAppModule.forRoot(...)
 ```
 
-**Regras de import (dependency inversion aplicada a módulos):**
+**Rules de import (inversão de dependência aplicada a módulos):**
 
 ```
-IntegrationCoreModule        ← não importa nada de integrations/*
-KafkaModule                  → importa IntegrationCoreModule (implementa ports)
-IntegrationAuthenticationModule → importa IntegrationCoreModule
-IntegrationWebhookModule     → importa IntegrationCoreModule, KafkaModule
-
-TrayIntegrationModule        → importa IntegrationCoreModule, IntegrationAuthenticationModule
-YampiIntegrationModule       → idem
-HotmartIntegrationModule     → idem
-
-EcommerceIntegrationModule   → importa TrayIntegrationModule, YampiIntegrationModule
-                              → importa IntegrationWebhookModule (para registrar rotas por domínio, se necessário)
-InfoproductIntegrationModule → importa HotmartIntegrationModule
-
-IntegrationsModule (raiz)    → importa EcommerceIntegrationModule, InfoproductIntegrationModule, KafkaModule.forRoot(...)
+MarketplaceCoreModule            ← não importa nada de providers/domínios
+TrayIntegrationModule            → importa MarketplaceCoreModule, libs/shared (auth/queue/lock)
+YampiIntegrationModule           → idem
+HotmartIntegrationModule         → idem
+EcommerceIntegrationModule       → importa Tray/Yampi + core webhook module
+InfoproductIntegrationModule     → importa Hotmart
+MarketplaceModule (raiz)         → importa os domínios + DataCrazyAppModule.forRoot(...)
 ```
 
-Nunca o inverso: `IntegrationCoreModule` **jamais** importa `TrayIntegrationModule`. Essa é a regra que evita ciclo e mantém o core "surdo" a providers específicos.
+Nunca o inverso. Essa é a regra que mantém o core "surdo" a providers e garante que a 10ª integração seja mais rápida que a 1ª.
 
 ---
 
-## 17. Exemplo completo: Tray
+## 16. Playbook — adicionar uma nova integração
 
-```
-providerId: 'tray'
-integrationType: ECOMMERCE
+1. Criar `providers/<novo>/module.ts` + `definition` + `*.auth.*` (reutilizando uma strategy `libs/shared` sempre que possível) + `*.webhook.adapter.*` + `*.<resource>.provider.*` + `*.mapper.*` + `*.api.client.*`.
+2. Implementar **só** o específico: assinatura, parsing, mapeamento → canonical, chamadas de API.
+3. Adicionar a classe ao array do token `"INTEGRATIONS_MARKETPLACE"` (e o webhook à rota/controller correto do domínio).
+4. Importar o módulo no módulo de domínio (`EcommerceIntegrationModule`) — ou criar um domínio novo.
+5. **Nenhuma alteração** em: Registry, core, envelope, controllers genéricos, queues, outros providers.
+6. `eventType` novo sem handler → `UnknownEventTypeException` → DLQ (seguro por default).
 
-Compartilhado (core/infra, zero código específico de Tray):
-  - IntegrationRegistry
-  - EventPublisher (Kafka)
-  - IdempotencyStore
-  - OAuth2Strategy (genérico, só configurado)
-  - HTTP client base com retry/circuit-breaker/interceptor de refresh
-  - Envelope factory
-  - WebhookController + WebhookRouter (pipeline genérico)
-  - IntegrationEventHandler (consumer genérico)
-
-Específico da Tray (módulo tray/):
-  - TrayAuthProvider          → new OAuth2Strategy(config Tray)
-  - TrayWebhookAdapter        → implements WebhookAdapter
-                                   .verifySignature() → HMAC-SHA256 conforme doc da Tray
-                                   .identifyEventType() → mapeia 'novo_pedido' → 'order.created'
-  - TrayOrderProvider         → implements OrderCapability, usa TrayApiClient
-  - TrayOrderMapper           → TrayOrderRaw → CanonicalOrder
-  - TrayApiClient             → usa o HTTP client base + TrayAuthProvider para headers
-  - TrayIntegrationModule     → monta tudo, registra no Registry via onModuleInit
-
-Erro/retry/idempotência: 100% herdados do core.
-  - Falha de rede na TrayApiClient → retry exponencial do HTTP client base (interceptor compartilhado)
-  - Webhook duplicado → IdempotencyStore genérico, chave = hash(providerId + trayEventId)
-  - Falha no consumer → retry local + DLQ, mecanismo genérico do Kafka module
-```
-
-O único código verdadeiramente "Tray" é: como assinar/verificar HMAC, quais endpoints chamar, como o JSON de pedido da Tray se parece e como virar `CanonicalOrder`. Tudo mais é reuso puro.
+Critério de sucesso: a partir da 3ª/4ª integração, só o passo 2 consome tempo; o resto é mecânico.
 
 ---
 
-## 18. Exemplo completo: Yampi
+## 17. O que NÃO abstrair no core
 
-```
-providerId: 'yampi'
-integrationType: ECOMMERCE
-```
+- Mapeamento provider → canonical (é específico por definição).
+- Verificação de assinatura de webhook (algoritmo varia por provider).
+- Regras de negócio de domínio (ficam em Application/Domain).
+- DSL de mapeamento config-driven key por JSON **antes** de 5+ casos reais.
+- `GenericProvider` universal (REST+GraphQL+SOAP+polling).
+- Herança entre domínios. Herança só faz sentido *dentro* do mesmo provider (`TrayApiClient extends BaseHttpClient`).
 
-Yampi reusa **exatamente** os mesmos componentes de core listados acima. O que muda:
-
-- `YampiAuthProvider` → também `OAuth2Strategy`, mas com `authorizationUrl`/`tokenUrl` diferentes — **zero código novo de autenticação**, só configuração.
-- `YampiWebhookAdapter` → assinatura verificada de forma diferente (Yampi usa um token estático no header, não HMAC) — implementação própria, mas do **mesmo contrato** `WebhookAdapter`.
-- `YampiOrderMapper` → `YampiOrderRaw → CanonicalOrder`. Se Yampi tiver um campo que Tray não tem (ex.: `installments`), ele entra em `CanonicalOrder.providerData` ou, se for suficientemente universal, vira um campo opcional novo no canonical (decisão de modelagem, não de arquitetura).
-
-**Onde "shared" termina e "provider-specific" começa:** exatamente na borda das abstract classes/ports (`WebhookAdapter`, `OrderCapability`, `AuthenticationStrategy`, `OrderMapper`). Tudo que implementa essas abstrações é specific; tudo que as consome (Registry, Controller, EventHandler, Kafka) é shared. Essa borda nunca muda de lugar ao adicionar um provider novo — é isso que faz a 10ª integração ser mais rápida que a 1ª.
+**Composição é a regra; herança, exceção pontual.**
 
 ---
 
-## 19. Exemplo completo: Hotmart
+## 18. Trade-offs aceitos (assinados)
 
-```
-providerId: 'hotmart'
-integrationType: INFOPRODUCT
-```
-
-Prova de que a arquitetura não está acoplada a e-commerce:
-
-- `IntegrationType.INFOPRODUCT` é só mais um valor de enum — o Registry, o Controller, o Kafka module não têm nenhuma menção a "order" hardcoded.
-- Capability usada é `SaleCapability`, não `OrderCapability` — modelo canônico próprio (`CanonicalSale`, com conceito de comissão de afiliado, produtor, coprodutor — que não existe em e-commerce).
-- `HotmartWebhookAdapter` implementa o mesmo `WebhookAdapter` genérico.
-- `HotmartAuthProvider` usa `ClientCredentialsStrategy` (Hotmart usa client_credentials, não authorization code) — outra strategy genérica já existente no core, sem código novo.
-- `HotmartIntegrationModule` importado por `InfoproductIntegrationModule`, paralelo a `EcommerceIntegrationModule` — nenhum dos dois se conhece, nenhum depende do outro.
-
-Isso confirma: o core não tem "e-commerce" embutido — `IntegrationType` é dado, não estrutura de código.
+- **`(type, providerId)` composta:** mais verboso, paga em autorização e organização de módulo. Aceito.
+- **Envelope com `correlationId`/`causationId`/metadados:** mais campos, porém essenciais em produção para debug distribuído. Aceito.
+- **Canonical model com `providerData` escape hatch:** menos "puro", evita perda de dado. Aceito.
+- **Registry por token nomeado + array explícito (em vez de self-registration `onModuleInit`):** consistente com o monorepo e pegável em compile-type. Aceito.
+- **Mapeamento completo fora do HTTP path:** latência e acoplamento vão para o consumer assíncrono retry-ável. Aceito.
+- **Conector genérico só para o perfil comum:** cobre o long tail sem puxar um framework universal. Aceito.
 
 ---
 
-## 20. Sequence Diagram — Webhook (com caminhos de erro)
+## 19. Critérios de sucesso / o que medir
 
-```mermaid
-sequenceDiagram
-    participant Tray
-    participant WC as WebhookController
-    participant REG as IntegrationRegistry
-    participant TA as TrayWebhookAdapter
-    participant IDM as IdempotencyStore
-    participant KFK as Kafka
-    participant CONS as Consumer
-    participant HND as IntegrationEventHandler
-    participant MAP as TrayOrderMapper
-    participant SVC as Application Service
-    participant DOM as Domain
-
-    Tray->>WC: POST /integrations/ecommerce/tray/webhooks
-    WC->>REG: get(ECOMMERCE, 'tray')
-    REG-->>WC: IntegrationDefinition
-
-    alt assinatura inválida
-        WC->>TA: verifySignature(req)
-        TA-->>WC: false
-        WC-->>Tray: 401 Unauthorized (não publica)
-    else assinatura válida
-        WC->>TA: verifySignature(req)
-        TA-->>WC: true
-        WC->>TA: parse(req)
-        TA-->>WC: raw payload
-        WC->>TA: extractIdempotencyKey(payload)
-        TA-->>WC: idempotencyKey
-
-        WC->>IDM: has(idempotencyKey)
-        alt já processado (duplicado)
-            IDM-->>WC: true
-            WC-->>Tray: 200 OK (idempotente, sem republicar)
-        else novo evento
-            IDM-->>WC: false
-            WC->>WC: build envelope
-
-            alt Kafka indisponível
-                WC->>KFK: publish(envelope)
-                KFK-->>WC: erro/timeout
-                WC-->>Tray: 503 (Tray fará retry do webhook)
-            else publicação ok
-                WC->>KFK: publish(envelope)
-                KFK-->>WC: ack
-                WC-->>Tray: 200 OK
-            end
-        end
-    end
-
-    KFK->>CONS: envelope (integration.ecommerce.order.created)
-    CONS->>HND: handle(envelope)
-    HND->>REG: get(envelope.integrationType, envelope.providerId)
-
-    alt evento desconhecido
-        REG-->>HND: definition
-        HND->>HND: getEventHandler('unknown.type') → undefined
-        HND-->>CONS: throw UnknownEventTypeException
-        CONS->>KFK: nack → retry local
-    else evento conhecido
-        REG-->>HND: definition
-        HND->>MAP: toCanonical(rawPayload)
-        MAP-->>HND: CanonicalOrder
-
-        alt falha de processamento (ex: DB down)
-            HND->>SVC: process(canonicalOrder)
-            SVC-->>HND: erro
-            HND-->>CONS: exception
-            CONS->>CONS: retry local (backoff exponencial, N tentativas)
-            alt excede tentativas
-                CONS->>KFK: publica em integration.ecommerce.order.created.dlq
-            end
-        else sucesso
-            HND->>SVC: process(canonicalOrder)
-            SVC->>DOM: aplica regras de domínio
-            DOM-->>SVC: ok
-            SVC->>IDM: markProcessed(idempotencyKey, ttl)
-            SVC-->>HND: ok
-            HND-->>CONS: ack
-        end
-    end
-```
-
----
-
-## 21. Sequence Diagram — Autenticação (OAuth2)
-
-```mermaid
-sequenceDiagram
-    participant FE as Frontend
-    participant BE as IntegrationAuthController
-    participant REG as IntegrationRegistry
-    participant AUTH as OAuth2Strategy (Tray config)
-    participant Tray as Provider (Tray)
-    participant VAULT as CredentialVault
-    participant DB as IntegrationInstanceRepo
-
-    FE->>BE: GET /integrations/ecommerce/tray/authorize?tenantId=X
-    BE->>REG: get(ECOMMERCE, 'tray')
-    REG-->>BE: definition.capabilities.auth
-    BE->>AUTH: buildAuthorizationUrl(tenantId, state)
-    AUTH-->>BE: authorizationUrl (com client_id, redirect_uri, scope, state)
-    BE-->>FE: redirect authorizationUrl
-
-    FE->>Tray: usuário autoriza no provider
-    Tray-->>BE: GET /callback?code=...&state=...
-
-    BE->>REG: get(ECOMMERCE, 'tray')
-    REG-->>BE: definition.capabilities.auth
-    BE->>AUTH: exchangeCodeForToken(code)
-    AUTH->>Tray: POST /oauth/token
-    Tray-->>AUTH: access_token, refresh_token, expires_in
-    AUTH-->>BE: CredentialSet
-
-    BE->>VAULT: store(credentialSet)
-    VAULT-->>BE: credentialsRef
-
-    BE->>DB: save IntegrationInstance{tenantId, providerId:'tray', credentialsRef, status:ACTIVE}
-    DB-->>BE: ok
-    BE-->>FE: 200 { status: 'connected' }
-```
-
-**Como o provider específico configura OAuth sem reimplementar o mecanismo:** `OAuth2Strategy` é genérica (`buildAuthorizationUrl`, `exchangeCodeForToken`, `refresh`) — recebe como config apenas os endpoints e credenciais de client do provider (`authorizationUrl`, `tokenUrl`, `clientId`, `clientSecret`, `scopes`). O módulo do provider só declara essa config via `useFactory`, nunca reimplementa o fluxo. Providers com fluxo verdadeiramente diferente (ex.: PKCE) usam `OAuth2PkceStrategy`, também genérica, reutilizável entre todos os providers que exigem PKCE.
-
----
-
-## 22. Fluxo de criação de uma nova integração (playbook)
-
-1. Criar `providers/<novo>/` com: `*.module.ts`, `*-auth.provider.ts` (reutilizando uma strategy existente sempre que possível), `*-webhook.adapter.ts`, `*-<resource>.provider.ts`, `*-<resource>.mapper.ts`, `*-api.client.ts`.
-2. Implementar apenas os pontos genuinamente específicos: verificação de assinatura, parsing de payload, mapeamento para canonical model, chamadas de API.
-3. `onModuleInit()` chama `registry.register(...)` com a `IntegrationDefinition` composta pelas capabilities implementadas.
-4. Importar o novo módulo no módulo de domínio correspondente (`EcommerceIntegrationModule`, por exemplo) ou criar um módulo de domínio novo, se for um domínio inédito.
-5. Nenhuma alteração em: `IntegrationRegistry`, `WebhookController`, `KafkaModule`, `IntegrationEventHandler`, outros providers.
-6. Se o provider tiver um `eventType` novo sem handler correspondente ainda, ele cai automaticamente em `UnknownEventTypeException` → DLQ, sem quebrar o consumer — desenvolvimento incremental é seguro por padrão.
-
-Esse é o critério de sucesso do ponto 24 do enunciado: a partir da 3ª ou 4ª integração, o passo 2 (specific) domina o tempo de trabalho; os passos 1, 3, 4, 5 são mecânicos.
-
----
-
-## 23. Trade-offs
-
-- **Chave composta (type+providerId) vs. providerId único:** mais verboso em toda chamada, mas paga em clareza de autorização e organização de módulo. Aceito.
-- **Envelope genérico com `metadata`/`correlationId`/`causationId`:** mais campos para manter, mas essenciais em produção para debug distribuído — cortar isso cedo é economia falsa.
-- **Canonical model com `providerData` escape hatch:** menos "puro" que um modelo 100% normalizado, mas evita perda de dado e resolve o problema do lowest common denominator. Trade-off aceito conscientemente.
-- **Tópico intermediário `integration.webhook.received` opcional:** desacopla parsing de mapeamento, mas adiciona um hop de latência e um consumer a mais para operar. Só vale a pena se o mapeamento for pesado/lento; caso contrário, publique direto no tópico canônico.
-- **`onModuleInit` self-registration vs. módulo agregador central:** self-registration é mais desacoplado, mas o erro de "esqueci de importar o módulo" só aparece em runtime (provider simplesmente não é encontrado), não em compile-time. Mitigar com testes de integração que verificam `registry.listByType()` contra uma lista esperada.
-- **Strategy de auth genérica (OAuth2/ApiKey/etc.) vs. 100% específica por provider:** genérica economiza código, mas exige que a strategy seja bem desenhada desde o início (parâmetros suficientes) — refatorar uma strategy usada por 8 providers é mais caro que criar uma nova. Vale investir tempo extra na 1ª/2ª implementação de cada strategy.
-
----
-
-## 24. O que deve ser abstraído
-
-- Resolução de provider (`IntegrationRegistry`)
-- Publicação/consumo de eventos (`EventPublisher`/`EventConsumer`)
-- Idempotência (`IdempotencyStore`)
-- Mecanismos de autenticação comuns (OAuth2, OAuth2+PKCE, ApiKey, Basic, ClientCredentials)
-- HTTP client base (retry, circuit breaker, interceptor de refresh de token)
-- Pipeline de webhook (verificação → parse → idempotência → publicação)
-- Envelope de evento e sua construção
-- Armazenamento de credenciais (`CredentialVault`)
-- Contrato de capabilities (interfaces `OrderCapability`, `WebhookCapability`, etc.)
-
-## 25. O que NÃO deve ser abstraído
-
-- Lógica de mapeamento provider → canonical (é, por definição, específica)
-- Verificação de assinatura de webhook (algoritmo varia por provider)
-- Regras de negócio de domínio (ficam no Application/Domain, não no core de integração)
-- "Frameworks" de configuração genéricos demais tentando prever toda variação futura (ex.: um DSL de mapeamento configurável via JSON antes de haver 5+ casos reais que justifiquem isso) — construa a abstração depois de ver o padrão se repetir 3 vezes, não antes.
-- Um `GenericProvider` "universal" que tenta lidar com REST, GraphQL, SOAP e polling ao mesmo tempo — cada integração tem um `ApiClient` próprio usando o HTTP client base; não force um client 100% genérico.
-
-## 26. Onde herança faz sentido
-
-Muito pouco, e sempre dentro do mesmo provider, nunca entre domínios: por exemplo, `TrayApiClient extends BaseHttpClient` (reuso de configuração de retry/timeout), ou duas variações de um mesmo provider (`TrayApiClientV1`/`V2` compartilhando um `AbstractTrayApiClient`). Herança nunca deve cruzar a fronteira "core → domínio → provider".
-
-## 27. Onde composição é melhor
-
-Praticamente em todo o resto: `IntegrationDefinition` composta por `CapabilitySet`; `Integration Instance` composta por credenciais + config; `AuthenticationStrategy` composta dentro do provider; pipeline de webhook composto por adapter + idempotency + publisher. Composição é a regra; herança é a exceção pontual.
-
-## 28. Onde Strategy faz sentido
-
-Autenticação (`AuthenticationStrategy` e suas variantes) é o caso mais claro. Também aplicável a: política de retry (`RetryStrategy` fixo vs. exponencial vs. baseado em `Retry-After` header), e estratégia de idempotência se você tiver mais de um backend (Redis vs. Postgres) coexistindo por razão de custo/latência.
-
-## 29. Onde Adapter faz sentido
-
-Toda ponta que fala com o mundo externo variável: `WebhookAdapter` (por provider), `OrderMapper`/`CustomerMapper`/`ProductMapper` (por provider), `ApiClient` (por provider, adaptando REST específico para um contrato interno). Adapter é o padrão dominante nas camadas `providers/*`.
-
-## 30. Onde Factory faz sentido
-
-Construção de `IntegrationDefinition` a partir de capabilities já injetadas (seção 7); construção de `HttpClient` configurado por `IntegrationInstance` (credenciais + baseUrl variam por tenant, então o client não pode ser singleton simples — uma factory monta um client por instance, cacheado por `instanceId`); construção do `Envelope` (`EnvelopeFactory.create(...)` centraliza geração de `eventId`, `receivedAt`, etc., garantindo consistência).
-
-## 31. Onde Registry faz sentido
-
-Descoberta de `IntegrationDefinition` por `(type, providerId)` — o caso central deste documento. Também aplicável, se necessário no futuro, a um registry secundário de `EventHandler` por `eventType` dentro de cada capability de webhook (`WebhookCapability.getEventHandler(eventType)` já é, na prática, um mini-registry local ao provider).
-
-## 32. Como escalar para dezenas de providers
-
-- **Core permanece do mesmo tamanho** independente de ter 3 ou 30 providers — ele não conhece nenhum provider por nome.
-- **Novas capabilities** (ex.: `RefundCapability`, `ShipmentCapability`) são adicionadas ao `CapabilitySet` como campos opcionais novos — não quebra providers existentes, que simplesmente não preenchem o campo.
-- **Novos domínios** (`LOGISTICS`, `MARKETING`) seguem o mesmo padrão de `EcommerceIntegrationModule`/`InfoproductIntegrationModule` — um módulo de domínio novo, paralelo, sem tocar nos existentes.
-- **Evite crescer o core com "só mais uma exceção"**: se um provider precisar de um comportamento que não se encaixa em nenhuma capability existente, prefira criar uma capability nova e específica (mesmo que só um provider a implemente inicialmente) a modificar uma capability existente para ter um "modo especial" condicional.
-- **Monitoria de inchaço:** revisitar periodicamente `AuthenticationStrategy` e `WebhookAdapter` — se três providers seguidos precisarem de pequenas variações na mesma strategy, é sinal de que falta um parâmetro de configuração nela (resolver configurando, não bifurcando com `if`).
-- **Times/ownership:** com dezenas de providers, cada `providers/<nome>/` deve ser dono de um time/pessoa, com testes de contrato (`registry.get(type, id)` retorna capabilities esperadas; `mapper.toCanonical(fixture)` bate com snapshot) rodando isoladamente — isso é o que garante que a 20ª integração não exige entender as outras 19.
+- **Tempo de um novo provider:** métrica de processo (ex.: P50 < X dias da 5ª integração em diante).
+- **Linhas tocadas no core por integração nova:** deve ser `0` (guard em CI).
+- **Testes de contrato por provider:** `registry.get(type, id)` retorna as capabilities esperadas; `mapper.toCanonical(fixture)` bate com snapshot — rodando isoladamente, sem entender os outros 19 (é isso que garante a 20ª integração barata).
+- **Webhook HTTP no SLA:** p99 < 100ms, nada de chamada externa no path.
+- **Sem `if (providerId === 'tray')`** fora do módulo do provider (grep como alerta de regressão).
