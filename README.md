@@ -340,9 +340,44 @@ marketplace.payment.charge.succeeded
 
 O esqueleto de todo webhook público do DataCrazy é o mesmo; o marketplace deve **copiá-lo**, não reinventar:
 
+**Resposta para a pergunta recorrente — "cada provider valida de um jeito, como todos consomem a MESMA rota?"**
+
+A rota é só um **dispatcher fino**: `:integrationType/:providerId` identifica *qual* definition/adapters usar. Toda a variação de segurança mora no **adapter**, em três coisas que o esqueleto acima não modela:
+
+1. **Método de validação** — sufixo com segredo na URL (Tray), header HMAC/estático (universal, api4com), signed body, token no `apiKey`, vai variar.
+2. **Resolução da instância/tenant** — precisa vir de um lugar: `:tenantId` na URL (WhatsApp), `:instanceId` (universal), ou correlação por campo do payload (`seller_id` na Tray, `phone_number_id` no WhatsApp).
+3. **GET de challenge** — WhatsApp/Instagram/Messenger pedem `hub.challenge` para provar propriedade da URL; a mesma rota precisa servir GET *e* POST.
+
+Contrato do adapter corrigido:
+
 ```typescript
+// context: o controller entrega TUDO cru + o rawBody preservado (ver nota HMAC abaixo)
+interface RawWebhookRequest {
+  method: "GET" | "POST";
+  headers: Record<string, string>;
+  query: Record<string, string>;
+  params: Record<string, string>;   // inclui :integrationType, :providerId e o ref de instância/secreto
+  rawBody: Buffer;                  // imprescindível p/ HMAC/signed body (ver nota)
+  parsedBody: unknown;
+}
+
 abstract class WebhookAdapter<TRaw = unknown> {
-  abstract verifySignature(req: RawWebhookRequest): boolean;      // timingSafeEqual/HMAC — varia por provider
+  // 1) SE a identidade chega na URL/header, resolve a instância; senão undefined
+  //    (ex.: Tray resolve daqui se quiser, mas na Tray a identidade vem do payload → resolve depois)
+  resolveInstance?(req: RawWebhookRequest): Promise<IntegrationInstance | undefined>;
+
+  // 2) Validação do provider: sufixo de segredo, HMAC no header, signed body...
+  //    Pode precisar do segredo da instância → recebe a instance resolvida (pode ser undefined
+  //    para providers que validam antes de saber o tenant, como a Tray hoje com secret no URL).
+  abstract verifySignature(req: RawWebhookRequest, instance?: IntegrationInstance): Promise<boolean>;
+
+  // 3) Validação por challenge (GET). Retorna o que responder ao provider.
+  verifyChallenge?(req: RawWebhookRequest, instance?: IntegrationInstance): Promise<string | undefined>;
+
+  // Correlação por payload (case de "identity vem no corpo"): acha as instâncias candidatas
+  // (usa repositório unsafe + cache — exatamente o resolveIntegration da Tray).
+  matchInstances?(payload: TRaw): Promise<IntegrationInstance[]>;
+
   abstract parse(req: RawWebhookRequest): TRaw;
   abstract identifyEventType(payload: TRaw): string;              // 'novo_pedido' → 'order.created'
   abstract extractIdempotencyKey(payload: TRaw): string;
@@ -350,7 +385,7 @@ abstract class WebhookAdapter<TRaw = unknown> {
 }
 ```
 
-Controller genérico (rota por domínio, loga cada passo em `IntegrationLog` — como o CRM faz):
+**Fluxo real no controller genérico (GET + POST na mesma rota):**
 
 ```typescript
 @Controller("webhooks/:integrationType/:providerId")  // fora do prefixo? ver main.ts
@@ -359,41 +394,72 @@ export class MarketplaceWebhookController {
   constructor(
     private readonly registry: MarketplaceRegistry,
     private readonly lock: DistributedLockService,
-    private readonly logRepository: IntegrationLogRepository,   // ou no handler
   ) {}
 
-  @Post()
-  async receive(
-    @Param("integrationType") type: IntegrationType,
-    @Param("providerId") providerId: string,
-    @Req() req: RawWebhookRequest,
-  ) {
-    const def = this.registry.get(type, providerId);
-    const webhook = def.capabilities.webhook;
-    if (!webhook) throw new NotFoundException();
+  // GET → challenge (WhatsApp/Instagram/Messenger). Devolve o que o adapter mandar.
+  @Get()
+  async verify(@Param() params, @Req() req) {
+    const webhook = this.resolveWebhook(params);
+    if (!webhook.adapter.verifyChallenge) throw new NotFoundException();
+    const inst = await webhook.adapter.resolveInstance?.(req);
+    const answer = await webhook.adapter.verifyChallenge(req, inst); // valida token/estado
+    if (!answer) throw new UnauthorizedException();
+    return answer;
+  }
 
-    if (!webhook.adapter.verifySignature(req)) throw new UnauthorizedException();
+  // POST → evento
+  @Post()
+  async receive(@Param() params, @Req() req) {
+    const webhook = this.resolveWebhook(params);
+
+    // 1a) identity na URL? resolve instância primeiro
+    const instance = await webhook.adapter.resolveInstance?.(req);
+
+    // 1b) validação — método do provider, com (ou sem) secret da instância
+    if (!(await webhook.adapter.verifySignature(req, instance))) throw new UnauthorizedException();
+    //    (falhou → não publica, não enfileira; considerar o padrão da Tray de responder ok:true
+    //     sem processar, para não vazar se o segredo está certo)
 
     const raw = webhook.adapter.parse(req);
-    const idempotencyKey = webhook.adapter.extractIdempotencyKey(raw);
 
-    // achar o tenant: via identificador na URL (:tenantId) ou correlação
-    // payload→instância (findUnsafeInstancesByUserIdAndProvider do messaging)
+    // 2) identity no payload? resolve depois de validar (Tray: seller_id via matchInstances)
+    const instances = instance
+      ? [instance]
+      : await webhook.adapter.matchInstances?.(raw) ?? [];
+
+    const idempotencyKey = webhook.adapter.extractIdempotencyKey(raw);
     return this.lock.executeWithLock(idempotencyKey, () =>
-      this.enqueue(envelope, raw),
+      this.dispatch(raw, instances),   // enfileira/Publica por instância — respeitando 200 idempotente
     );
-    // retorna 200 idempotente se já processado
   }
 }
 ```
 
+**Como cada provider existente vira um adapter disso (prova de que a rota única funciona):**
+
+| Provider | `resolveInstance` | `verifySignature` | `verifyChallenge` | `matchInstances` |
+|---|---|---|---|---|
+| **Tray** | — (identity no payload) | compara o sufixo `:secret` da URL com o segredo (idealmente **por instância**, ver nota) via `timingSafeEqual` | — | `seller_id` → repo unsafe + cache 30s (`resolveIntegration` atual) |
+| **WhatsApp** | — | — (não assina: confia no challenge + throttle) | `hub.challenge` | `phone_number_id` no payload (`findUnsafeInstancesByUserIdAndProvider`) |
+| **Universal** | `:tenantId/:instanceId` | header config-driven `static/sha1/sha256/hmac-sha256` (`universal-connection` já faz) | — | já está na URL |
+| **Hotmart/Shopify/Stripe** (futuro) | —/URL | HMAC do **rawBody** com webhookSecret da instância | — | campo do payload |
+
+**Nota HMAC/signed body — leia duas vezes:** quem assina o corpo (Shopify, Stripe, Hotmart, universal `sha256/hmac`) precisa **do corpo cru exato** que o provider enviou. **Nunca** re-serialize com `JSON.stringify(parsedBody)` para validar — ordem de campos/preservação de espaços quebra a assinatura. O controller precisa capturar `rawBody` (ex.: preservar no parser do Nest/Express ou `raw-body` no `main.ts`) e entregar no `RawWebhookRequest`. Trecho do `main.ts`:
+
+```typescript
+app.useBodyParser("json", { verify: (_req, _res, buf) => { rawBodyRef.set(buf); } });
+// ou: manter um body parser que copia o buffer antes do parse; o adapter recebe Buffer + parsedBody juntos.
+```
+
+**Nota sobre o segredo da Tray (melhoria em relação ao código atual):** hoje o CRM compara `:secret` contra `process.env.TRAY_WEBHOOK_SECRET` — um segredo **global** para todos os tenants. Num marketplace, o secret deve ser **por instância**: gerado no connect, gravado em `credentials`/`CredentialVault`, e a URL do webhook entregue ao provider carrega esse token (`.../webhooks/ecommerce/tray/{instanceId}?secret=xxx` — ou o padrão da Tray de sufixo na URL). Isso dá isolamento entre tenants e rotação de segredo individual. O adapter safe-compare o que veio na URL contra o da instância.
+
 **Pipeline extremamente importante — o que NÃO fazer no path HTTP (meta p99 < 100ms):**
 - Não mapear para canonical model aqui. O que sai do HTTP é o payload **cru/levemente normalizado** dentro do envelope. Mapeamento completo é assíncrono, no consumer, retry-ável.
 - Não chamar API externa no HTTP path.
-- Verificação de assinatura falhou → **não publica, não enfileira** → `401`.
+- Verificação de assinatura falhou → **não publica, não enfileira** → `401` (ou `ok:true` sem processar, padrão Tray, para não vazar).
 - Redis/lock indisponível → `503` e o provider fará retry.
 
-O XML/JSON assinatura detalhada de cada provider (a assinatura secreta no header `X-Signature`, token estático, HMAC-SHA256) é **implementação do adapter** — o pipeline é compartilhado; só o `verifySignature`/`parse` varia. O `universal-connection` já é um exemplo de provider que faz esse pipeline **config-driven** (`receive.signatureHeader + algorithm sha256/sha1/hmac-sha256/static`) — pode ser a base do "conector genérico" do marketplace (seção 14).
+O `universal-connection` já é prova viva de que **uma rota única sustenta múltiplos algoritmos de validação**: hoje ele resolve delegando ao config (`receive.signatureHeader + algorithm sha256/sha1/hmac-sha256/static`). No marketplace essa mesma flexibilidade vira **código por provider (Strategy)**, com a opção de reusar a versão config-driven para o conector genérico (seção 14).
 
 ---
 
