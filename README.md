@@ -1,695 +1,598 @@
-# Marketplace — Módulo de Integrações Reutilizável (Arquitetura DataCrazy)
+# Spike: Marketplace de Integrações — Proposta Plug-and-Play
 
-> Documento arquitetural, não um tutorial. Os trechos TypeScript são **contratos conceituais** (formato de interfaces/abstrações), baseados em padrões que **já existem e são usados em produção** no DataCrazy — não em abstrações inventadas para este projeto. A regra de ouro: *antes de criar qualquer abstração nova, procure o padrão equivalente que já roda no monorepo e reuse*.
+> **Para quem é este documento:** você, raciocinando antes da apresentação; e a empresa, entendendo o investimento sem mergulhar em código.
 >
-> Referências usadas: `datacrazy-services/libs/*`, `datacrazy-services/src/services/crm/src/modules/integrations`, `datacrazy-services/src/services/messaging/src/modules/{engines,instances,universal-connection}`, `libs/events/ecommerce/ecommerce-webhook.event.ts`.
+> **Tom:** técnico e não-técnico misturados. Conceito simples primeiro, tradução técnica depois, entre parênteses.
+>
+> **Objetivo do spike:** validar que dá para conectar um novo parceiro (Tray, Shopify, WhatsApp, Hotmart…) sem mexer no coração do sistema, começando pequeno e encaixando peças aos poucos.
 
 ---
 
-## 0. Diagnóstico: o que já existe no DataCrazy e o que precisa ser criado
+## 1. A ideia central: integração como Lego, não como obra
 
-Antes de desenhar, vale separar o que **não é trabalho novo** — porque o monorepo já resolve — do que **é trabalho novo** de verdade.
+**Não-técnico:** Hoje cada integração nova é como construir um cômodo novo em uma casa: quebra parede, passa fiação, pinta. A proposta é transformar isso em **móveis modulares**: o sistema é a sala, e cada integração é um móvel que encaixa em tomadas-padrão na parede. A sala não muda; só o móvel muda.
 
-| Tema | Já existe no DataCrazy | Precisa ser criado |
+**Técnico:** Em vez do código perguntar `if (provider === "tray") { ... }` espalhado pelo sistema, o núcleo pergunta por **capability** (`orders?`, `webhook?`) e um **registry** resolve qual implementação concreta atende aquele `(tipo, provider)`. Isso é inversão de controle: o núcleo define as portas, os providers entregam os adaptadores.
+
+**A metáfora do plug-and-play:**
+
+| Peça do Lego | O que é na prática | Analogia do dia a dia |
 |---|---|---|
-| Provider pluggable / registry por token | ✅ CRM `"INTEGRATIONS"` (array `integrations`) e messaging `"CHAT_SERVICES"`/`"CONTACT_SERVICES"`/`"CONFIGURATION_SERVICES"` + resolvers (`engines.providers.module.ts`) | Nada — só replicar o padrão no marketplace |
-| Entidade persistida por tenant com `type`/`providerId`/`fields` | ✅ CRM `Integration` (domain) e `Instance` (messaging) | Evoluir para `IntegrationDefinition` (estático) × `IntegrationInstance` (tenant) |
-| Webhook público seguro (assinatura + throttle + troca de tenant) | ✅ Padrão `@Public()` + `@WebhookThrottler()` + `SessionContext.changeTenant()` em todos os providers (tray, api4com, wavoip, whatsapp-cloud, universal...) | Nada — copiar o esqueleto |
-| Consumidor cross-service de evento externo | ✅ `EcommerceWebhookKafkaEvent` + `@KafkaTopic` + `EventHandler` (tray → flow trigger via `TrayIntegrationEventHandler`) | Reusar, criando os eventos do marketplace |
-| Filas com contexto de sessão restaurado | ✅ `QueueModule.registerQueue` + `registerProcessor`, `QueueProcessor` (restaura `sessionContext` de `QueueData`) | Nada |
-| Lock distribuído / idempotência | ✅ `DistributedLockService.executeWithLock` (chave prefixada por tenant), idempotência/dedup no `QueueManager` | Porta de `IdempotencyStore` de longa duração se precisar de TTL > fila |
-| Criptografia de credenciais | ✅ `CryptoHelpers.encrypt/decrypt` (AES-256-CBC) | **Porta `CredentialVault`** para isolar quem guarda o quê |
-| Auth genérico (OAuth2/ApiKey/... reutilizável entre providers) | ❌ OAuth vive duplicado em `tray-authenticator.service.ts` e `whatsapp-cloud.auth.controller.ts` | **Strategies genéricas** em `libs/shared` (seção 11) |
-| Integração "genérica config-driven" | ✅ `universal-connection` (config declarativa `send`/`receive`/`auth`/`credentials`) | Referência para o "conector genérico" do marketplace |
-| Mapeamento canônico (Order/Customer/Product) | ❌ Nenhum canonical model cross-provider | Ícone central do marketplace (seção 13) |
-| Catálogo/definição estática de provider | ✅ nenhum (só `types.enum.ts` com 5 tipos) | **`IntegrationDefinition` + `CapabilitySet`** (seção 4) |
+| **Tabuleiro (core)** | Registry, rota única de webhook, envelope, idempotência | A tomada na parede |
+| **Peça de encaixe (capability)** | Contrato tipado: `OrderCapability`, `WebhookCapability` | O formato do plugue (2 pinos, 3 pinos) |
+| **Módulo do provider** | Tray, Shopify, WhatsApp, Hotmart | O aparelho que você liga |
+| **Configuração por tenant** | `IntegrationInstance` (loja 1001, segredo X, tenant-1) | O cadastro do aparelho na conta do cliente |
 
-**A decisão arquitetural mais importante deste documento:** o marketplace não deve desenhar um "framework de integrações" do zero. Ele deve **promover a abstração que já existe no CRM (`IntegrationService`/`IntegrationWebhookService`/`IntegrationResolver`)** para o nível de *definition/capability*, e **plagiar o registry por token nomeado do messaging** — isso é o esqueleto do que você quer. O resto é encaixar as peças compartilhadas já prontas.
+> **Regra de ouro:** para adicionar um provider novo, você só cria um novo módulo. Se precisar abrir o `core` ou mexer em outro provider, o formato do plugue está errado.
 
----
-
-## 1. O modelo mental do marketplace (três eixos ortogonais)
-
-Nunca misture os três em uma única hierarquia de classes (é o erro clássico que gera `EcommerceIntegrationWithoutRefundsBase`):
-
-1. **Type / Domínio** — classificação de negócio (`ECOMMERCE`, `INFOPRODUTO`, `CRM`, `PAYMENT`, `SHIPPING`...). Não implica comportamento técnico.
-2. **Provider** — quem implementa capabilities concretas (`tray`, `yampi`, `hotmart`, `shopify`...). É o ponto de composição.
-3. **Capability** — comportamento reutilizável e opcional (`AUTH`, `WEBHOOK`, `ORDERS`, `PRODUCTS`, `CUSTOMERS`, `REFUNDS`, `SALES`...). É o que o core consome via **porta tipada**, nunca via `providerId`.
-
-O core do marketplace **nunca** pergunta "quem é o provider" para decidir comportamento. Ele pergunta "esse provider tem a capability X?" e, se sim, invoca a porta correspondente. Quem sabe que `tray` ↔ implementação concreta de `OrderCapability` é **exclusivamente o Registry** — o mesmo raciocínio dos resolvers `ChatServicesResolver`/`IntegrationResolver` que já existem.
-
-> No DataCrazy isso já está meio feito em duas versões imperfeitas:
-> - CRM (`integrations`) chegou em **type estruturado** (`IntegrationService.type` + array `integrations` + `IntegrationResolver`), mas sem capabilities — o `IntegrationWebhookService` está em outro array, desconectado do `IntegrationService`.
-> - Messaging (`engines`) chegou em **registry por token nomeado** (`"CHAT_SERVICES"` + resolvers), mas o "type" é o provider em si, sem domínio.
->
-> O marketplace é a oportunidade de fazer **um** padrão completo: capability composta dentro da definition, um só registry.
-
----
-
-## 2. Camadas (Dependency Inversion — como já é no monorepo)
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│ libs/shared (KafkaPubSub, QueueModule, DistributedLock,      │
-│              SessionContext, PrismaRepository, guards,       │
-│              CryptoHelpers, MicroserviceClient)              │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │ Marketplace Core (REGISTRY + ports/capabilities +      │ │
-│  │              envelope)                                  │ │
-│  │   ┌──────────────────────────────────────────────────┐ │  │
-│  │   │ Providers (tray, yampi, hotmart...)               │ │ │
-│  │   │   └── Adapters/Strategies (auth, webhook, mapper)│ │ │
-│  │   └──────────────────────────────────────────────────┘ │  │
-│  └────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
-```
-
-Regra de import (idêntica à que o monorepo já respeita): o **core nunca importa provider**. A dependência é sempre `ProviderModule → CoreModule` (via `DataCrazyAppModule`/`DataCrazyModule`), nunca o inverso. O registry não conhece Tray — conhece a interface `IntegrationDefinition`.
-
-### Onde cada peça compartilhada entra
-
-| Peça do marketplace | Infra DataCrazy que implementa |
-|---|---|
-| Registry + resolvers | `IntegrationResolver` (CRM), resolvers do messaging — mesmo `useFactory(...services[]) => services` + token nomeado |
-| Publicação de eventos | `EventsPubSub.publish()` / `KafkaPubSub` — já injeta `event["sessionContext"]` |
-| Consumer | `@KafkaTopic({ pool: { concurrency } })` + `EventHandler` (restaura sessão + retry 3) |
-| Filas de processamento pesado | `QueueModule.registerQueue("nome")` + `registerProcessor(SeuProcessor)` (**as duas chamadas, não esquecer**) |
-| Idempotência do webhook | `DistributedLockService.executeWithLock` com `eventId`/`externalEventId` como chave + dedup do `QueueManager` |
-| Troca de tenant em webhook/consumer | `SessionContext.changeTenant(tenantId, ...)` — obrigatório em todo entrypoint público |
-| Persistência tenant-scoped | `PrismaRepository` (fixedWhere `{tenantId, deletedAt:null}`) |
-| Criptografia | `CryptoHelpers.encrypt/decrypt` (AES-256-CBC, `CRYPTO_SECRET_KEY`) |
-| Guards de rota | `@Public()` + `@WebhookThrottler()` + `@Roles`, `@PlanNotFree` |
-| Contratos cross-service | `DomainEvent`/`DomainRequest` em `libs/events`, `@MicroserviceRequestHandler` |
-
----
-
-## 3. Diagrama geral (Mermaid)
+### 1.1 Visão geral das peças
 
 ```mermaid
 graph TB
-    subgraph Provider["Providers externos"]
-        TRAY[Tray API/Webhook]
-        YAMPI[Yampi API/Webhook]
-        HOTMART[Hotmart API/Webhook]
-    end
-
-    subgraph Edge["HTTP Edge (rápido, sem lógica de negócio)"]
-        WC[MarketplaceWebhookController]
-    end
-
-    subgraph Registry["Marketplace Registry (token nomeado + resolver)"]
+    subgraph Core["Tabuleiro (core) — não muda nunca"]
         REG[MarketplaceRegistry]
-        DEF[IntegrationDefinitions]
+        ENV[Envelope]
+        CTRL[WebhookController<br/>rota única]
+        IDM[Idempotência]
     end
 
-    subgraph Adapters["Provider Adapters / Strategies"]
-        TA[Tray: AuthStrategy + WebhookAdapter + OrderProvider + Mapper]
-        YA[Yampi: OAuth2Strategy + WebhookAdapter + OrderProvider + Mapper]
-        HA[Hotmart: ClientCredentialsStrategy + WebhookAdapter + SaleProvider + Mapper]
+    subgraph Capabilities["Peças de encaixe (contratos)"]
+        WEB[WebhookCapability]
+        ORD[OrderCapability]
+        AUTH[AuthenticationStrategy]
     end
 
-    subgraph Infra["Infraestrutura compartilhada"]
-        QUEUE[QueueModule: marketplace-webhook-messages]
-        KFK[KafkaPubSub / EventBus]
-        LOCK[DistributedLockService]
-        CLS[SessionContext.changeTenant]
+    subgraph Providers["Kits de provider — plugáveis"]
+        TRAY[Tray]
+        SHO[Shopify]
+        WHA[WhatsApp]
+        NOVO[Novo provider...]
     end
 
-    subgraph App["Application / Domain"]
-        HANDLER[MarketplaceEventHandler / QueueProcessor]
-        SVC[Application Service]
-        DOM[Canonical Models]
+    subgraph Tenant["Dados por tenant"]
+        INST[IntegrationInstance]
     end
 
-    TRAY -->|POST webhook| WC
-    YAMPI -->|POST webhook| WC
-    HOTMART -->|POST webhook| WC
+    TRAY -->|implementa| WEB
+    TRAY -->|implementa| ORD
+    SHO -->|implementa| WEB
+    SHO -->|implementa| ORD
+    WHA -->|implementa| WEB
+    NOVO -->|implementa| WEB
+    NOVO -->|implementa| ORD
 
-    WC --> REG
-    REG --> DEF
-    REG -.resolve.-> TA
-    REG -.resolve.-> YA
-    REG -.resolve.-> HA
+    WEB --> REG
+    ORD --> REG
+    AUTH --> REG
 
-    WC --> LOCK
-    WC --> QUEUE
-    QUEUE --> KFK
-    KFK --> HANDLER
-    HANDLER --> SVC
-    SVC --> DOM
+    CTRL -->|usa| REG
+    CTRL -->|usa| IDM
+    CTRL -->|publica| ENV
+
+    INST -->|configura| TRAY
+    INST -->|configura| SHO
+    INST -->|configura| WHA
 ```
 
 ---
 
-## 4. `IntegrationDefinition` (estático, sem tenant) × `IntegrationInstance` (tenant)
+## 2. O que já está maduro nos seus documentos (vale a pena manter)
 
-Essa dupla é a evolução do que já existe:
+Depois de ler os quatro markdowns e o MVP em `/marketplace`, estas são as decisões que mais valem à pena:
 
-- O CRM tem `Integration` (persistida, com tenant — papel de **Instance**) mas não tem a **Definition** (o "catálogo": o que o provider *sabe fazer*).
-- O messaging tem `Instance` (provider/engine/config — papel de **Instance**), e o "catálogo" é apenas o array de providers no `engines.providers.module.ts`.
+### 2.1 Definition × Instance
 
-```typescript
-// core/capabilities/capability-set.ts
-export type CapabilitySet = {
-  auth?: AuthenticationStrategy;          // presença = suporte (porta tipada, não flag)
+**Não-técnico:** Separa "o que o parceiro sabe fazer" do "quem realmente conectou".
+
+**Técnico:**
+- `IntegrationDefinition`: código, singleton, sem tenant. Diz que "Tray sabe webhook + orders".
+- `IntegrationInstance`: dado, por tenant. Diz que "tenant-1 conectou a loja 1001 da Tray com segredo X".
+
+**Por que mantém:** evita o erro clássico de misturar comportamento e estado numa única classe `TrayIntegration`.
+
+```mermaid
+erDiagram
+    IntegrationDefinition ||--o{ CapabilitySet : "composto por"
+    IntegrationDefinition ||--|| IntegrationType : "é do tipo"
+    IntegrationInstance ||--|| IntegrationDefinition : "referencia"
+
+    IntegrationDefinition {
+        string providerId
+        string type
+        string displayName
+        CapabilitySet capabilities
+    }
+
+    IntegrationInstance {
+        string id
+        string tenantId
+        string providerId
+        string type
+        string credentialsRef
+        json config
+        string status
+    }
+
+    CapabilitySet {
+        WebhookCapability webhook
+        OrderCapability orders
+        AuthenticationStrategy auth
+    }
+```
+
+### 2.2 Capability como objeto tipado, não enum
+
+**Não-técnico:** Não basta dizer "a Tray faz pedidos". Você precisa da peça que realmente faz pedidos, com os conectores certos.
+
+**Técnico:**
+
+```ts
+// ✅ objeto tipado — o tipo já entrega a implementação
+interface CapabilitySet {
   webhook?: WebhookCapability;
   orders?: OrderCapability;
-  products?: ProductCapability;
-  customers?: CustomerCapability;
-  sales?: SaleCapability;                 // infoproduto
-  shipments?: ShipmentCapability;          // extensível SEM alterar o core
-  // cada capability é um campo opcional — novo provider só preenche o que tem
-};
+}
 
-// core/domain/integration-definition.ts
-export class IntegrationDefinition {
-  readonly providerId: string;            // 'tray'
-  readonly type: IntegrationType;         // ECOMMERCE
-  readonly displayName: string;
-  readonly capabilities: CapabilitySet;
+// ❌ enum flat — te obriga a cast inseguro depois
+interface BadDefinition {
+  capabilities: ("webhook" | "orders")[];
 }
 ```
 
-**Por que `CapabilitySet` objeto e não `capabilities: string[]`?**
-Porque enum array te obriga a `registry.getCapability(provider, 'ORDERS') as OrderCapability` — cast inseguro, o famoso `if/switch` disfarçado. Com `CapabilitySet`, `definition.capabilities.orders` já é `OrderCapability | undefined`, checável com type guard e sem cast. É o mesmo raciocínio que motivou o `types.enum.ts` do CRM, mas levado ao tipo da *implementação*, não ao rótulo.
+### 2.3 Rota única de webhook + adapter por provider
 
-**`IntegrationInstance`** — continue seguindo o modelo do messaging `Instance`:
+**Não-técnico:** Uma única porta de entrada para todos os parceiros. Cada um valida do seu jeito, mas o caminho de entrada é o mesmo.
 
-```typescript
-export class IntegrationInstance {
-  id: string;
-  tenantId: string;                       // preenchido pelo PrismaRepository/MongoRepository
-  providerId: string;
-  credentialsRef: string;                 // ponteiro p/ vault — CriptoHelpers na porta, nunca cru no domínio
-  config: Record<string, unknown>;        // { storeId, environment: 'production' }
-  status: 'ACTIVE' | 'DISABLED' | 'ERROR';
-}
-```
+**Técnico:** `GET/POST /webhooks/:type/:provider/:secret?` despacha para `WebhookAdapter`. A variação (HMAC, segredo na URL, challenge GET) vive no adapter, nunca no controller.
 
-Definition = **comportamento** (singleton, injetado via DI no bootstrap do módulo).
-Instance = **dado de configuração** (linha de banco, carregada por repositório).
-Nunca misture os dois numa entidade única com estado de tenant embutido.
+### 2.4 Envelope canônico
+
+**Não-técnico:** Toda mensagem, venha de quem vier, é reescrita numa "carta padrão" com os mesmos campos: de quem veio, que evento é, qual o id do pedido, quando aconteceu.
+
+**Técnico:** `MarketplaceWebhookEnvelope` com `eventType` canônico (`order.created`), `idempotencyKey` determinística, `tenantId`, `providerId`, `payload`, `metadata`.
+
+### 2.5 Idempotência determinística
+
+**Não-técnico:** Se a Tray reenviar o mesmo aviso, o sistema reconhece e não processa de novo. O retry do parceiro não vira pedido duplicado.
+
+**Técnico:** `idempotencyKey = hash(providerId + externalEventId)`. Mesmo payload = mesma chave. Lock + marcação de "já processado".
+
+### 2.6 `providerData` como escape hatch
+
+**Não-técnico:** Se só um parceiro tem um campo especial, ele fica num cantinho separado, não suja o modelo padrão.
+
+**Técnico:** `CanonicalOrder.providerData?: unknown`. Campos sem equivalência semântica em 2+ providers não viram campo canônico.
+
+### 2.7 Auth por Strategy
+
+**Não-técnico:** OAuth2, API key, basic auth viram "peças de autenticação" reutilizáveis. Yampi e Shopify podem usar a mesma peça, só com configuração diferente.
+
+**Técnico:** `abstract class AuthenticationStrategy` com implementações `OAuth2Strategy`, `ApiKeyStrategy`, `ClientCredentialsStrategy`.
+
+### 2.8 Não fazer conector universal no primeiro dia
+
+**Não-técnico:** Não tente criar uma peça que sirva para todos os aparelhos antes de conhecer os aparelhos. As 3 primeiras integrações são manuais para descobrir o padrão.
+
+**Técnico:** Só abstrair o conector config-driven depois de 3–4 providers manuais evidenciarem a repetição.
 
 ---
 
-## 5. Registry — o padrão que você já usa (token nomeado + resolver)
+## 3. O que NÃO vale a pena no spike inicial (corte consciente)
 
-No DataCrazy, registry **não é** `Map` populado em `onModuleInit` — é a combinação de **token nomeado + `useFactory` de array + resolver** (megje `engines.providers.module.ts` e `integrations/integration.module.ts`). Replicar isso é a escolha certa, porque é o padrão que o time já entende e testa:
+A proposta é **começar pequeno, medir, depois adicionar peças**. Estes itens são valiosos, mas para depois:
 
-```typescript
-// marketplace.providers.module.ts
-@Module({ /* imports: DataCrazyModule, ... */ })
-export class MarketplaceProvidersModule {
-  // Existem N implementações de IntegrationDefinition sob o mesmo token "INTEGRATIONS_MARKETPLACE"
-}
-```
+| Item | Por que cortar agora | Quando voltar |
+|---|---|---|
+| **Kafka como transporte obrigatório** | O monorepo já tem Kafka, mas para validar a tese da rota única, o handler pode ser síncrono no mesmo processo. | Assim que o spike provar que providers encaixam, migrar para `@KafkaTopic` + `QueueProcessor`. |
+| **CredentialVault como porta separada** | CryptoHelpers já existe. No spike, criptografar no repo é suficiente. | Quando houver múltiplos serviços consumindo credenciais. |
+| **Conector genérico config-driven** | Sem 3 providers manuais, você não sabe quais variações precisa suportar. | Após a 3ª/4ª integração, se o padrão se repetir. |
+| **DLQ complexa** | Retry local + log de erro basta para provar o conceito. | Quando o handler for realmente assíncrono em produção. |
+| **Schema registry / Avro** | `metadata.schemaVersion` em JSON é suficiente para começar. | Quando o volume de eventos justificar. |
+| **Canonical models para tudo** | Comece só com `Order` (e-commerce) e `Message` (mensageria). Não force `CanonicalProduct` se ninguém ainda cruza produtos. | Quando um segundo consumer precisar cruzar aquele recurso. |
+| **Múltiplos microserviços** | O "marketplace" pode nascer como **um novo serviço** (o que você já propôs), mas não precisa de 3 serviços no spike. | Quando o tráfego/domínio exigir separar order-sync, notification, etc. |
+| **`onModuleInit` self-registration** | O monorepo usa token nomeado + array explícito. Manter isso é mais previsível e pega erro de módulo esquecido em teste. | Se o array ficar gigante, aí sim avaliar auto-registro. |
 
-```typescript
-// core/registry/marketplace.registry.ts
-@Injectable()
-export class MarketplaceRegistry {
-  // injetado via @Inject("INTEGRATIONS_MARKETPLACE")
-  constructor(private readonly definitions: IntegrationDefinition[]) {}
-
-  get(type: IntegrationType, providerId: string): IntegrationDefinition {
-    const def = this.definitions.find(
-      (d) => d.type === type && d.providerId === providerId,
-    );
-    if (!def) throw new IntegrationNotFoundException(type, providerId);
-    return def;
-  }
-
-  listByType(type: IntegrationType): IntegrationDefinition[] {
-    return this.definitions.filter((d) => d.type === type);
-  }
-}
-```
-
-**`(type, providerId)` como chave composta** é decisão de design, não capricho: particiona o namespace por domínio (autorização "este tenant só habilita ECOMMERCE"), facilita roteamento de webhook e evita colisão de nome comercial entre domínios. Trate como value object `IntegrationKey`, nunca string concatenada manualmente.
-
-**Como adicionar um novo provider SEM tocar no core:**
-
-1. Criar `providers/<novo>/` com o módulo + capabilities que fizerem sentido.
-2. Adicionar a classe ao array do módulo provisionado pelo token `"INTEGRATIONS_MARKETPLACE"` (ex.: `const marketplaceIntegrations = [TrayIntegrationDefinition, YampiIntegrationDefinition, ...]` seguindo a convenção de `integrations` do CRM).
-3. Registrar o controller de webhook do provider em `MarketplaceWebhookController` — ou, melhor, um controller genérico que resolve via Registry (seção 8).
-4. **Zero linhas alteradas** em Registry, core, publisher, consumers.
-5. Se o provider tiver `eventType` novo sem handler, cai em `UnknownEventTypeException` → DLQ, sem quebrar ninguém (seguro por default).
-
-> **Trade-off vs. autorregistro via `onModuleInit`:** o padrão de array explícito do monorepo é melhor aqui — quem esquece de importar o módulo quebra em *compile-type*/*teste de integração*, não em runtime, e é consistente com `registerQueue`+`registerProcessor`. Mitigue com um teste que compara `registry.listByType()` contra uma lista esperada.
+> **Princípio do corte:** se uma peça não é necessária para provar "novo provider sem mexer no core", ela fica para a fase 2.
 
 ---
 
-## 6. Modelo de dados (Prisma, seguindo o CRM)
+## 4. O spike: o que vamos construir
 
-```prisma
-model MarketplaceIntegrationDefinition {
-  id          String   @id @default(uuid())
-  providerId  String
-  type        String
-  displayName String
-  capabilities Json     // snapshot pg para o catálogo (UI/admin); o comportamento é código
-  @@unique([type, providerId])
-}
+### 4.1 Escopo mínimo viável
 
-model MarketplaceIntegration {
-  id            String  @id @default(uuid())
-  tenantId      String
-  definitionRef String  // "ECOMMERCE:tray"
-  credentialsRef String
-  config        Json    @default("{}")
-  status        String  @default("ACTIVE")
-  @@index([tenantId, definitionRef])
-}
-```
+**Objetivo:** ter um serviço `marketplace` novo, com **3 providers** passando pela mesma rota de webhook, cada um com validação diferente, e produzindo eventos canônicos.
 
-**Regras do monorepo que se aplicam aqui:**
-- `snake_case` com `@@map`/`@map`, `deletedAt` para soft-delete, ids uuid UI (convenção do `schema.prisma` do accounts/crm).
-- Repositório estende `PrismaRepository` — o `fixedWhere()` já força `{ tenantId, deletedAt: null }` e lança `InvalidTenantException` sem tenant.
-- Unsafe (`*UnsafeRepository`) **só** para o roteamento de webhook público (achar a instância do provider por `providerId`/`storeId` antes de ter tenant) — literalmente o que `findUnsafeInstancesByUserIdAndProvider` do messaging faz.
+**Providers do spike:**
+1. **Tray** (e-commerce) — validação por segredo na URL.
+2. **Shopify** (e-commerce) — validação por HMAC-SHA256 do `rawBody`.
+3. **WhatsApp** (mensageria) — validação por challenge GET + correlação por `phone_number_id`.
 
----
+**Por que esses 3:** cobrem os 3 perfis de validação mais comuns (segredo, assinatura, challenge). Se a rota única aguenta esses 3, aguenta dezenas.
 
-## 7. Envelope de eventos — adaptação do modelo DataCrazy
-
-O DataCrazy **não** tem um `IntegrationEvent<T>` genérico no padrão do documento original; o padrão real é `DomainEvent` + payload tipado + `@KafkaTopic` (`EcommerceWebhookKafkaEvent` é o exemplo). Recomendação: **adotar um envelope de integração explícito** em `libs/events/marketplace/`, porque o payload cru do provider + metadados de observabilidade não cabem bem no `DomainEvent` raquítico de hoje:
-
-```typescript
-// libs/events/marketplace/marketplace-webhook.event.ts
-export const MARKETPLACE_WEBHOOK_TOPIC = "marketplace.webhook.received";
-
-@KafkaTopic({ pool: { concurrency: 5 } })
-export class MarketplaceWebhookKafkaEvent extends DomainEvent {
-  constructor(public readonly data: MarketplaceWebhookEnvelope) {
-    super(data);
-  }
-}
-
-export interface MarketplaceWebhookEnvelope {
-  eventId: string;
-  eventType: string;              // canônico: 'ecommerce.order.created' (não o nome cru do provider)
-  version: number;                // versão do envelope, não do payload
-  tenantId: string;
-  integrationType: IntegrationType;
-  providerId: string;
-  correlationId: string;
-  causationId?: string;
-  idempotencyKey: string;         // hash determinístico (providerId + externalEventId)
-  occurredAt: string;             // quando aconteceu no provider
-  receivedAt: string;             // quando a plataforma recebeu
-  metadata: {
-    schemaVersion: number;
-    traceId?: string;
-    retryCount?: number;
-    rawPayloadRef?: string;       // blob store, nunca JSON gigante na mensagem
-  };
-  payload: Record<string, unknown>; // tipado por evento no consumer
-}
-
-export function createMarketplaceWebhookEvent(
-  payload: MarketplaceWebhookEnvelope,
-): MarketplaceWebhookKafkaEvent {
-  return new MarketplaceWebhookKafkaEvent(payload);
-}
-```
-
-Pontos que a experiência DataCrazy valida:
-- **`correlationId`/`causationId`**: cobrem a cadeia webhook → order.created → flow trigger (exatamente o caminho `EcommerceWebhookKafkaEvent` → `TrayIntegrationEventHandler` → `TrayIntegrationTrigger`).
-- **`idempotencyKey` determinística**: reprocessar o mesmo webhook do provider (retry) gera a **mesma** chave — senão a idempotência não funciona. Compõe com `DistributedLockService.executeWithLock(idempotencyKey)` no consumer e com o dedup do `QueueManager`.
-- **`sessionContext`**: o `EventsPubSub.publish()` injeta `event["sessionContext"]` automaticamente — o consumer restaura via `EventHandler`. Mantenha `sessionContext` fora do `data` tipado; ele é infraestrutura do barramento.
-
-**Tópicos** (dois níveis, granularidade `domain.resource.event`, nunca por provider):
+### 4.2 O tabuleiro (core) — peças fixas
 
 ```
-marketplace.webhook.received                  # entrada crua (opcional; só se o parsing for pesado)
-marketplace.ecommerce.order.created
-marketplace.ecommerce.order.updated
-marketplace.ecommerce.customer.created
-marketplace.infoproduct.sale.created
-marketplace.infoproduct.subscription.cancelled
-marketplace.payment.charge.succeeded
-```
-
-- Particionar por `tenantId` (ordering por tenant garantido — é o que importa). Nunca por `eventId` nem por `providerId`.
-- Consumer groups por responsabilidade de negócio (`order-sync-service`, `notification-service`), não por provider.
-- Retry local (padrão `EventHandler`, 3 tentativas) → DLQ após exceder (padrão `dead.letter.event.ts`/`failed-event-recovery`).
-- Evolução: `metadata.schemaVersion`; mudança aditiva não incrementa, breaking exige versão nova.
-
----
-
-## 8. Arquitetura de Webhook (o padrão que o monorepo já repete em N providers)
-
-O esqueleto de todo webhook público do DataCrazy é o mesmo; o marketplace deve **copiá-lo**, não reinventar:
-
-**Resposta para a pergunta recorrente — "cada provider valida de um jeito, como todos consomem a MESMA rota?"**
-
-A rota é só um **dispatcher fino**: `:integrationType/:providerId` identifica *qual* definition/adapters usar. Toda a variação de segurança mora no **adapter**, em três coisas que o esqueleto acima não modela:
-
-1. **Método de validação** — sufixo com segredo na URL (Tray), header HMAC/estático (universal, api4com), signed body, token no `apiKey`, vai variar.
-2. **Resolução da instância/tenant** — precisa vir de um lugar: `:tenantId` na URL (WhatsApp), `:instanceId` (universal), ou correlação por campo do payload (`seller_id` na Tray, `phone_number_id` no WhatsApp).
-3. **GET de challenge** — WhatsApp/Instagram/Messenger pedem `hub.challenge` para provar propriedade da URL; a mesma rota precisa servir GET *e* POST.
-
-Contrato do adapter corrigido:
-
-```typescript
-// context: o controller entrega TUDO cru + o rawBody preservado (ver nota HMAC abaixo)
-interface RawWebhookRequest {
-  method: "GET" | "POST";
-  headers: Record<string, string>;
-  query: Record<string, string>;
-  params: Record<string, string>;   // inclui :integrationType, :providerId e o ref de instância/secreto
-  rawBody: Buffer;                  // imprescindível p/ HMAC/signed body (ver nota)
-  parsedBody: unknown;
-}
-
-abstract class WebhookAdapter<TRaw = unknown> {
-  // 1) SE a identidade chega na URL/header, resolve a instância; senão undefined
-  //    (ex.: Tray resolve daqui se quiser, mas na Tray a identidade vem do payload → resolve depois)
-  resolveInstance?(req: RawWebhookRequest): Promise<IntegrationInstance | undefined>;
-
-  // 2) Validação do provider: sufixo de segredo, HMAC no header, signed body...
-  //    Pode precisar do segredo da instância → recebe a instance resolvida (pode ser undefined
-  //    para providers que validam antes de saber o tenant, como a Tray hoje com secret no URL).
-  abstract verifySignature(req: RawWebhookRequest, instance?: IntegrationInstance): Promise<boolean>;
-
-  // 3) Validação por challenge (GET). Retorna o que responder ao provider.
-  verifyChallenge?(req: RawWebhookRequest, instance?: IntegrationInstance): Promise<string | undefined>;
-
-  // Correlação por payload (case de "identity vem no corpo"): acha as instâncias candidatas
-  // (usa repositório unsafe + cache — exatamente o resolveIntegration da Tray).
-  matchInstances?(payload: TRaw): Promise<IntegrationInstance[]>;
-
-  abstract parse(req: RawWebhookRequest): TRaw;
-  abstract identifyEventType(payload: TRaw): string;              // 'novo_pedido' → 'order.created'
-  abstract extractIdempotencyKey(payload: TRaw): string;
-  abstract toEnvelopePayload(payload: TRaw): unknown;             // normalização mínima, NÃO mapeamento completo
-}
-```
-
-**Fluxo real no controller genérico (GET + POST na mesma rota):**
-
-```typescript
-@Controller("webhooks/:integrationType/:providerId")  // fora do prefixo? ver main.ts
-export class MarketplaceWebhookController {
-  // @Public() + @WebhookThrottler() — como todo webhook do monorepo
-  constructor(
-    private readonly registry: MarketplaceRegistry,
-    private readonly lock: DistributedLockService,
-  ) {}
-
-  // GET → challenge (WhatsApp/Instagram/Messenger). Devolve o que o adapter mandar.
-  @Get()
-  async verify(@Param() params, @Req() req) {
-    const webhook = this.resolveWebhook(params);
-    if (!webhook.adapter.verifyChallenge) throw new NotFoundException();
-    const inst = await webhook.adapter.resolveInstance?.(req);
-    const answer = await webhook.adapter.verifyChallenge(req, inst); // valida token/estado
-    if (!answer) throw new UnauthorizedException();
-    return answer;
-  }
-
-  // POST → evento
-  @Post()
-  async receive(@Param() params, @Req() req) {
-    const webhook = this.resolveWebhook(params);
-
-    // 1a) identity na URL? resolve instância primeiro
-    const instance = await webhook.adapter.resolveInstance?.(req);
-
-    // 1b) validação — método do provider, com (ou sem) secret da instância
-    if (!(await webhook.adapter.verifySignature(req, instance))) throw new UnauthorizedException();
-    //    (falhou → não publica, não enfileira; considerar o padrão da Tray de responder ok:true
-    //     sem processar, para não vazar se o segredo está certo)
-
-    const raw = webhook.adapter.parse(req);
-
-    // 2) identity no payload? resolve depois de validar (Tray: seller_id via matchInstances)
-    const instances = instance
-      ? [instance]
-      : await webhook.adapter.matchInstances?.(raw) ?? [];
-
-    const idempotencyKey = webhook.adapter.extractIdempotencyKey(raw);
-    return this.lock.executeWithLock(idempotencyKey, () =>
-      this.dispatch(raw, instances),   // enfileira/Publica por instância — respeitando 200 idempotente
-    );
-  }
-}
-```
-
-**Como cada provider existente vira um adapter disso (prova de que a rota única funciona):**
-
-| Provider | `resolveInstance` | `verifySignature` | `verifyChallenge` | `matchInstances` |
-|---|---|---|---|---|
-| **Tray** | — (identity no payload) | compara o sufixo `:secret` da URL com o segredo (idealmente **por instância**, ver nota) via `timingSafeEqual` | — | `seller_id` → repo unsafe + cache 30s (`resolveIntegration` atual) |
-| **WhatsApp** | — | — (não assina: confia no challenge + throttle) | `hub.challenge` | `phone_number_id` no payload (`findUnsafeInstancesByUserIdAndProvider`) |
-| **Universal** | `:tenantId/:instanceId` | header config-driven `static/sha1/sha256/hmac-sha256` (`universal-connection` já faz) | — | já está na URL |
-| **Hotmart/Shopify/Stripe** (futuro) | —/URL | HMAC do **rawBody** com webhookSecret da instância | — | campo do payload |
-
-**Nota HMAC/signed body — leia duas vezes:** quem assina o corpo (Shopify, Stripe, Hotmart, universal `sha256/hmac`) precisa **do corpo cru exato** que o provider enviou. **Nunca** re-serialize com `JSON.stringify(parsedBody)` para validar — ordem de campos/preservação de espaços quebra a assinatura. O controller precisa capturar `rawBody` (ex.: preservar no parser do Nest/Express ou `raw-body` no `main.ts`) e entregar no `RawWebhookRequest`. Trecho do `main.ts`:
-
-```typescript
-app.useBodyParser("json", { verify: (_req, _res, buf) => { rawBodyRef.set(buf); } });
-// ou: manter um body parser que copia o buffer antes do parse; o adapter recebe Buffer + parsedBody juntos.
-```
-
-**Nota sobre o segredo da Tray (melhoria em relação ao código atual):** hoje o CRM compara `:secret` contra `process.env.TRAY_WEBHOOK_SECRET` — um segredo **global** para todos os tenants. Num marketplace, o secret deve ser **por instância**: gerado no connect, gravado em `credentials`/`CredentialVault`, e a URL do webhook entregue ao provider carrega esse token (`.../webhooks/ecommerce/tray/{instanceId}?secret=xxx` — ou o padrão da Tray de sufixo na URL). Isso dá isolamento entre tenants e rotação de segredo individual. O adapter safe-compare o que veio na URL contra o da instância.
-
-**Pipeline extremamente importante — o que NÃO fazer no path HTTP (meta p99 < 100ms):**
-- Não mapear para canonical model aqui. O que sai do HTTP é o payload **cru/levemente normalizado** dentro do envelope. Mapeamento completo é assíncrono, no consumer, retry-ável.
-- Não chamar API externa no HTTP path.
-- Verificação de assinatura falhou → **não publica, não enfileira** → `401` (ou `ok:true` sem processar, padrão Tray, para não vazar).
-- Redis/lock indisponível → `503` e o provider fará retry.
-
-O `universal-connection` já é prova viva de que **uma rota única sustenta múltiplos algoritmos de validação**: hoje ele resolve delegando ao config (`receive.signatureHeader + algorithm sha256/sha1/hmac-sha256/static`). No marketplace essa mesma flexibilidade vira **código por provider (Strategy)**, com a opção de reusar a versão config-driven para o conector genérico (seção 14).
-
----
-
-## 9. Consumidor do marketplace (filas + eventos)
-
-Dois mecanismos do monorepo se encaixam aqui, por throughput e criticidade:
-
-1. **Envelope leve → Kafka** (`MarketplaceWebhookKafkaEvent`): para eventos tipados que outros microserviços consomem (flow do CRM se inscreve em `marketplace.ecommerce.order.created`).
-2. **Processamento pesado/retry-ável → BullMQ** (`QueueModule.registerQueue("marketplace-webhook-messages")` + `registerProcessor(SeuProcessor)`): para mapear canonical model, persistir, notificar — com `QueueProcessor` restaurando `sessionContext` de `QueueData`.
-
-```typescript
-// processor
-@Processor("marketplace-webhook-messages", { concurrency: 10 })
-export class MarketplaceWebhookProcessor extends QueueProcessor<MarketplaceWebhookEnvelope> {
-  // QueueProcessor já restaura o context de sessão do job.data.sessionContext
-  async execute(data: MarketplaceWebhookEnvelope): Promise<void> {
-    await this.lock.executeWithLock(data.idempotencyKey, () =>
-      this.handler.handle(data),
-    );
-  }
-}
-```
-
-Tudo que o consumer precisa já vem no envelope (`tenantId`, `integrationType`, `providerId`, `eventType`) — igual o `EventHandler` do CRM resolve `EcommerceWebhookKafkaEvent` → `TrayIntegrationTrigger`.
-
----
-
-## 10. Idempotência — sem reinventar
-
-Hoje o monorepo tem idempotência **de curta duração** embutida (`QueueManager` dedup + lock `executeWithLock`). Para webhook/evento de marketplace, a recomendação é:
-
-- **Camada 1 (HTTP):** `executeWithLock("webhook:" + idempotencyKey, ...)` — não republica/enfileira o mesmo webhook.
-- **Camada 2 (consumer):** lock + checar "já processado" na aplicação, porque Kafka/filas garantem *at-least-once*, não *exactly-once*. Uma column `processedKey`/marcador na `IntegrationLog` serve (ou `markProcessed` com TTL num `IdempotencyStore` se o volume justificar).
-
-Não crie um framework de idempotência; **crie a porta** (`abstract IdempotencyStore`) e deixe a implementação seguir em `KafkaIdempotencyStore`/prisma como *infra* — exatamente o estilo `IdempotencyStore` do documento original, mas plugado no `DistributedLockService` que já existe.
-
----
-
-## 11. Autenticação — por Strategy (composição), não herança
-
-Hoje o OAuth vive **duplicado** (tray, whatsapp-cloud, facebook-leadgen, google-calendar). O marketplace paga esse débito promovendo strategies genéricas para `libs/shared`:
-
-```typescript
-// libs/shared/src/integration-auth/strategies/authentication.strategy.ts
-export abstract class AuthenticationStrategy {
-  abstract getAuthorizationHeaders(instance: IntegrationInstance): Promise<Record<string, string>>;
-  abstract refresh?(instance: IntegrationInstance): Promise<CredentialSet>;
-}
-
-// strategies concretas, reutilizáveis entre providers
-export class OAuth2Strategy extends AuthenticationStrategy { /* config: authorizationUrl, tokenUrl, clientId, clientSecret, scopes */ }
-export class OAuth2PkceStrategy extends AuthenticationStrategy {}
-export class ApiKeyStrategy extends AuthenticationStrategy {}
-export class ClientCredentialsStrategy extends AuthenticationStrategy {}
-export class BasicAuthStrategy extends AuthenticationStrategy {}
-```
-
-- Yampi e Shopify usam **a mesma** `OAuth2Strategy`, configurada diferente (`useFactory` a partir do módulo do provider) — zero código novo de auth.
-- Provider com fluxo proprietário (HMAC custom) → implementa `AuthenticationStrategy` propria, sem nova abstração no core.
-- **Refresh automático de token** no provider (tray já faz: `TrayAuthenticatorService` + `ExecuteWithFreshTokenCommandHandler`) é candidato a virar **core reutilizável**: um interceptor/"fresh-token" executor compartilhado, não reimplementado por provider.
-- **Credenciais** criptografadas com `CryptoHelpers` e guardadas via uma **porta `CredentialVault`** (hoje o acesso é espalhado em cache/fields). A strategy pede credenciais, não as persiste.
-
----
-
-## 12. Capabilities — par (porta tipada, implementação opcional)
-
-```typescript
-// core/capabilities/order-capability.ts
-export abstract class OrderCapability {
-  abstract getOrder(instance: IntegrationInstance, externalId: string): Promise<CanonicalOrder>;
-  abstract listOrders(instance: IntegrationInstance, filter: OrderFilter): Promise<Page<CanonicalOrder>>;
-}
-
-// core/capabilities/webhook-capability.ts
-export abstract class WebhookCapability {
-  abstract adapter: WebhookAdapter;
-  abstract getEventHandler(eventType: string): EventHandler | undefined;
-}
-```
-
-Capability **não é herança nem enum flag** — é presença opcional num slot tipado do `CapabilitySet`. Quem não suporta `refunds` simplesmente não preenche o slot; o consumidor faz `if (def.capabilities.refunds) {...}` — igual ao messaging decide "qual engine" via resolver, mas com tipo garantido pelo compilador.
-
----
-
-## 13. Canonical Models — o item de maior valor do marketplace
-
-**Quando criar:** o recurso é (a) consultado/cruzado por consumers agnósticos a provider (dashboard financeiro somando `Order.total` de Tray + Yampi), ou (b) publicado como evento que outros serviços consomem sem saber a origem.
-
-**Quando NÃO criar:** dados que só fazem sentido no fluxo do provider e nunca são cruzados — deixe no payload cru, no `providerData`, não force campo canônico vazio.
-
-**Onde fica o mapping:** no **Mapper do provider** (`tray-order.mapper.ts`), parte do módulo do provider, invocado pelo handler genérico — nunca no core. O core só define o shape do contrato.
-
-```typescript
-// ecommerce/domain/canonical-order.ts
-export interface CanonicalOrder {
-  externalId: string;
-  tenantId: string;
-  providerId: string;
-  status: CanonicalOrderStatus;       // enum canônico com mapeamento de status por provider
-  total: Money;
-  items: CanonicalOrderItem[];
-  customer: CanonicalCustomerRef;
-  createdAt: Date;
-  updatedAt: Date;
-  providerData?: unknown;             // escape hatch explícito, tipado no adapter do provider
-}
-```
-
-`providerData` é o antídoto contra o "lowest common denominator": o modelo carrega o que tem equivalência semântica real; o resto fica acessível, mas fora do contrato. E o erro de "forçar Hotmart sale virar Order" é o mesmo de sempre: são **dois domínios** (`CanonicalSale` com comissão de afiliado ≠ `CanonicalOrder`), com modelos canônicos próprios — não force um modelo único.
-
----
-
-## 14. O "conector genérico" — herança do `universal-connection`, não um DSL novo
-
-O messaging já tem o blueprint do conector universal: `UniversalConnectionConfig { send, receive, auth, credentials }` — endpoints declarativos, `responseMapping`, `retry`, validação de assinatura configurável, log completo de request/response com mascaramento de header.
-
-Para o marketplace, o movimento certo é:
-
-- **Não fazer** um "GenericProvider universal" que tenta REST/GraphQL/SOAP/polling ao mesmo tempo.
-- **Fazer** o provider genérico apenas para o *perfil de integração* mais comum (webhook de eventos + fetch por API de recurso com auth padronizado), **config-driven** como o universal-connection — útil para o "long tail" de integrações que um parceiro liga sem escrever código.
-- Todo resto continua com `ApiClient` próprio por provider sobre o `HttpModule` compartilhado (retry/circuit-breaker/refresh de token).
-
-Regra prática: **construa a abstração config-driven depois de ver o padrão se repetir 3x**, não antes (o próprio universal-connection só nasceu depois de N providers de mensageria).
-
----
-
-## 15. Estrutura de módulos proposta (no novo microserviço `marketplace`)
-
-Convenção `domain/ application/ infra/` + registro centralizado (padrão CRM/AGENTS.md):
-
-```
-src/
-  marketplace/
-    core/                                    # NUNCA importa provider
+marketplace/
+  src/
+    core/
       registry/
-        marketplace.registry.ts
-        integration-key.ts
+        marketplace.registry.ts          # índice type:providerName
+        integration-key.ts               # value object da chave composta
         integration-not-found.exception.ts
       capabilities/
-        order-capability.ts
+        capability-set.ts                # { webhook?, orders?, auth? }
+        webhook-adapter.ts               # contrato de validação/parsing
         webhook-capability.ts
-        product-capability.ts
-        customer-capability.ts
-        sale-capability.ts
-        auth-capability.ts                   # abstract AuthenticationStrategy
-      events/
-        marketplace.envelope.ts
-        idempotency-store.port.ts            # implementação: DistributedLockService/prisma
-      credentials/
-        credential-vault.port.ts             # implementação: CryptoHelpers + fields/cache
-      marketplace-core.module.ts             # @Global() via DataCrazyModule pattern
-
-    ecommerce/
-      domain/ canonical-order.ts canonical-customer.ts canonical-product.ts
-      application/ order-event.handler.ts ecommerce-integration.module.ts
-      providers/
-        tray/
-          tray.module.ts
-          tray.definition.ts                 # monta CapabilitySet + registry token
-          tray.auth.strategy.ts              # OAuth2Strategy configurada
-          tray.webhook.adapter.ts
-          tray.order.provider.ts
-          tray.order.mapper.ts
-          tray.api.client.ts
-        yampi/ ...
-    infoproduct/
-      domain/ canonical-sale.ts
-      application/ sale-event.handler.ts infoproduct-integration.module.ts
-      providers/hotmart/ ...
-
-  marketplace.module.ts                      # agrega, importa DataCrazyAppModule.forRoot(...)
+        order-capability.ts              # getOrder(externalId)
+      domain/
+        integration-type.enum.ts         # ECOMMERCE, MESSAGING...
+        integration-definition.ts        # o que o provider SABE fazer
+        integration-instance.ts          # quem ESTÁ conectado
+        canonical-order.ts               # contrato entre providers
+      marketplace-core.module.ts         # @Global: registry + stores
+    webhooks/
+      webhook.controller.ts              # ROTA ÚNICA
+    application/
+      integration-instance.store.ts      # demo: array; prod: PrismaRepository
+      marketplace-event.handler.ts       # envelope + idempotência + consume
+      helpers/safe-compare.ts
+    marketplace.module.ts                # agrega tudo + INTEGRATION_DEFINITIONS
 ```
 
-**Rules de import (inversão de dependência aplicada a módulos):**
+**Não-técnico:** O tabuleiro é a parte que você constrói **uma vez**. Depois disso, ela não muda mais.
+
+```mermaid
+graph TB
+    subgraph HTTP["HTTP Edge"]
+        CTRL[WebhookController]
+    end
+
+    subgraph Core["Core (tabuleiro)"]
+        REG[MarketplaceRegistry]
+        ENV[Envelope Factory]
+        IDM[Idempotency]
+        HAND[EventHandler]
+    end
+
+    subgraph Providers["Providers (kits)"]
+        TRAY[Tray Adapter]
+        SHO[Shopify Adapter]
+        WHA[WhatsApp Adapter]
+    end
+
+    subgraph Data["Dados"]
+        INST[(IntegrationInstance)]
+    end
+
+    CTRL -->|resolve| REG
+    REG -->|entrega| TRAY
+    REG -->|entrega| SHO
+    REG -->|entrega| WHA
+
+    CTRL -->|usa| IDM
+    CTRL -->|cria| ENV
+    ENV --> HAND
+    HAND -->|carrega| INST
+```
+
+### 4.3 Os módulos de provider — peças plugáveis
 
 ```
-MarketplaceCoreModule            ← não importa nada de providers/domínios
-TrayIntegrationModule            → importa MarketplaceCoreModule, libs/shared (auth/queue/lock)
-YampiIntegrationModule           → idem
-HotmartIntegrationModule         → idem
-EcommerceIntegrationModule       → importa Tray/Yampi + core webhook module
-InfoproductIntegrationModule     → importa Hotmart
-MarketplaceModule (raiz)         → importa os domínios + DataCrazyAppModule.forRoot(...)
+providers/
+  tray/
+    tray.module.ts
+    tray.definition.ts                 # registra capabilities no token
+    tray.webhook.adapter.ts            # validação + parse + identifica evento
+    tray.order.provider.ts             # implementa OrderCapability
+    tray.order.mapper.ts               # TrayOrderRaw → CanonicalOrder
+  shopify/
+    shopify.module.ts
+    shopify.definition.ts
+    shopify.webhook.adapter.ts
+    shopify.order.provider.ts
+    shopify.order.mapper.ts
+  whatsapp/
+    whatsapp.module.ts
+    whatsapp.definition.ts
+    whatsapp.webhook.adapter.ts        # sem orders, só webhook
 ```
 
-Nunca o inverso. Essa é a regra que mantém o core "surdo" a providers e garante que a 10ª integração seja mais rápida que a 1ª.
+**Não-técnico:** Cada provider é um "kit de montar". Quando chega um quarto provider, você só adiciona mais um kit.
+
+### 4.4 A rota única em detalhe
+
+```
+GET/POST /webhooks/:type/:provider/:secret?
+```
+
+**Não-técnico:** Uma única URL recebe todos os avisos. O sistema olha o caminho (`ecommerce/tray`, `ecommerce/shopify`, `messaging/whatsapp`) e entrega para o kit certo.
+
+**Técnico — fluxo do controller:**
+
+```
+1. registry.get(type, provider) → IntegrationDefinition
+2. pega adapter da capability webhook
+3. (se GET) verifyChallenge → responde challenge
+4. (se POST)
+   4.1 resolveInstance? (URL/header) ou valida primeiro
+   4.2 verifySignature(req, instance?) → 401 se falhar
+   4.3 parse(req) → raw payload
+   4.4 matchInstances?(payload) → identidade por body
+   4.5 extractIdempotencyKey(payload)
+   4.6 se já processado → 200 idempotente
+   4.7 handler.handle(raw, instance, envelopePayload) → evento canônico
+   4.8 responde 200
+```
+
+**Regras importantes:**
+- Não chamar API externa no path HTTP (meta p99 < 100ms).
+- Não fazer mapeamento completo para `CanonicalOrder` no HTTP path — isso é no handler/consumer.
+- Preservar `rawBody` para HMAC (`bodyParser.verify`).
+
+```mermaid
+sequenceDiagram
+    participant Provider as Provider (Tray/Shopify/WhatsApp)
+    participant Ctrl as WebhookController
+    participant REG as MarketplaceRegistry
+    participant Adap as WebhookAdapter
+    participant IDM as Idempotência
+    participant Hdl as EventHandler
+
+    Provider->>Ctrl: POST /webhooks/:type/:provider
+    Ctrl->>REG: get(type, provider)
+    REG-->>Ctrl: IntegrationDefinition
+    Ctrl->>Adap: verifySignature(req, instance?)
+
+    alt assinatura inválida
+        Adap-->>Ctrl: false
+        Ctrl-->>Provider: 401 Unauthorized
+    else assinatura válida
+        Adap-->>Ctrl: true
+        Ctrl->>Adap: parse(req)
+        Adap-->>Ctrl: raw payload
+        Ctrl->>Adap: extractIdempotencyKey(payload)
+        Adap-->>Ctrl: idempotencyKey
+        Ctrl->>IDM: já processou?
+
+        alt já processado
+            IDM-->>Ctrl: sim
+            Ctrl-->>Provider: 200 OK idempotente
+        else novo evento
+            IDM-->>Ctrl: não
+            Ctrl->>Hdl: handle(raw, instance, envelopePayload)
+            Hdl-->>Ctrl: evento canônico publicado
+            Ctrl-->>Provider: 200 OK
+        end
+    end
+```
+
+### 4.5 O envelope (a "carta padrão")
+
+```json
+{
+  "eventId": "uuid",
+  "eventType": "order.created",
+  "version": 1,
+  "integrationType": "ECOMMERCE",
+  "providerName": "tray",
+  "providerId": "1001",
+  "tenantId": "tenant-1",
+  "correlationId": "uuid",
+  "idempotencyKey": "tray:1001:ORD-100:created",
+  "occurredAt": "2026-09-28T10:00:00Z",
+  "receivedAt": "2026-09-28T10:00:01Z",
+  "metadata": { "schemaVersion": 1 },
+  "payload": { "sellerId": "1001", "orderId": "ORD-100", "scopeName": "order", "act": "created" }
+}
+```
+
+**Não-técnico:** Mesmo que Tray mande JSON, Shopify mande outro JSON e WhatsApp mande uma estrutura diferente, para o resto do sistema tudo chega na mesma carta padrão.
+
+```mermaid
+graph LR
+    subgraph Entrada["Payloads diferentes"]
+        TRAW[Tray JSON]
+        SRAW[Shopify JSON]
+        WRAW[WhatsApp JSON]
+    end
+
+    subgraph Normalizacao["Normalização mínima"]
+        ENV[MarketplaceWebhookEnvelope]
+    end
+
+    subgraph Saida["Modelos canônicos"]
+        ORD[CanonicalOrder]
+        MSG[CanonicalMessage]
+    end
+
+    TRAW -->|toEnvelopePayload| ENV
+    SRAW -->|toEnvelopePayload| ENV
+    WRAW -->|toEnvelopePayload| ENV
+
+    ENV -->|orders capability| ORD
+    ENV -->|webhook capability| MSG
+```
+
+### 4.6 O CanonicalOrder mínimo
+
+```ts
+interface CanonicalOrder {
+  externalId: string;           // id do pedido no provider
+  tenantId: string;
+  providerName: string;
+  providerId: string;
+  status: "CREATED" | "PAID" | "CANCELLED";
+  total: { currency: string; value: number };
+  items: Array<{ sku: string; quantity: number }>;
+  customer: { name?: string; email?: string };
+  createdAt: Date;
+  updatedAt: Date;
+  providerData?: unknown;       // escape hatch
+}
+```
+
+**Não-técnico:** O contrato carrega só o que realmente é comum entre e-commerces. O resto fica no `providerData`, sem sujar o padrão.
 
 ---
 
-## 16. Playbook — adicionar uma nova integração
+## 5. A adoção em ondas (o plano de spike)
 
-1. Criar `providers/<novo>/module.ts` + `definition` + `*.auth.*` (reutilizando uma strategy `libs/shared` sempre que possível) + `*.webhook.adapter.*` + `*.<resource>.provider.*` + `*.mapper.*` + `*.api.client.*`.
-2. Implementar **só** o específico: assinatura, parsing, mapeamento → canonical, chamadas de API.
-3. Adicionar a classe ao array do token `"INTEGRATIONS_MARKETPLACE"` (e o webhook à rota/controller correto do domínio).
-4. Importar o módulo no módulo de domínio (`EcommerceIntegrationModule`) — ou criar um domínio novo.
-5. **Nenhuma alteração** em: Registry, core, envelope, controllers genéricos, queues, outros providers.
-6. `eventType` novo sem handler → `UnknownEventTypeException` → DLQ (seguro por default).
+### Onda 1 — Tabuleiro de pé + Tray (2 semanas)
 
-Critério de sucesso: a partir da 3ª/4ª integração, só o passo 2 consome tempo; o resto é mecânico.
+**Entrega:**
+- Core (registry, envelope, rota única, idempotência).
+- Tray de ponta a ponta: webhook → validação → evento canônico → `CanonicalOrder`.
+
+**Prova:** novo pedido da Tray vira `order.created` e `CanonicalOrder` sem código específico no controller.
+
+### Onda 2 — Shopify prova que a validação muda sem quebrar o core (1 semana)
+
+**Entrega:**
+- Shopify plugado na mesma rota.
+- Validação por HMAC-SHA256 do `rawBody`.
+
+**Prova:** o controller não sabe que é Shopify; só o adapter sabe.
+
+### Onda 3 — WhatsApp prova outro domínio (1 semana)
+
+**Entrega:**
+- WhatsApp na rota única, com challenge GET.
+- Evento `message.received` no mesmo envelope.
+
+**Prova:** um novo `IntegrationType` (MESSAGING) entra sem alterar o core.
+
+### Onda 4 — Medir a curva (1 semana)
+
+**Entrega:**
+- Adicionar um 4º provider (ex.: Yampi ou Hotmart) medindo arquivos tocados.
+- Documentar o playbook.
+
+**Prova:** o 4º provider exige menos alterações que o 2º.
+
+### Onda 5 — Decidir o próximo salto
+
+**Opções:**
+- Mover handler para Kafka/`QueueProcessor`.
+- Criar conector genérico config-driven.
+- Adicionar capabilities novas (`products`, `customers`).
+
+**Regra:** só decide com dados das ondas 1–4.
 
 ---
 
-## 17. O que NÃO abstrair no core
+## 6. O playbook do novo provider
 
-- Mapeamento provider → canonical (é específico por definição).
-- Verificação de assinatura de webhook (algoritmo varia por provider).
-- Regras de negócio de domínio (ficam em Application/Domain).
-- DSL de mapeamento config-driven key por JSON **antes** de 5+ casos reais.
-- `GenericProvider` universal (REST+GraphQL+SOAP+polling).
-- Herança entre domínios. Herança só faz sentido *dentro* do mesmo provider (`TrayApiClient extends BaseHttpClient`).
+Quando chegar um parceiro novo, o trabalho é:
 
-**Composição é a regra; herança, exceção pontual.**
+1. Criar `src/providers/<novo>/`.
+2. Implementar:
+   - `<novo>.definition.ts` — qual tipo e capabilities.
+   - `<novo>.webhook.adapter.ts` — validação, parse, identifica evento, idempotency key.
+   - `<novo>.order.provider.ts` + `<novo>.order.mapper.ts` — se expõe orders.
+   - `<novo>.module.ts` — declara providers e exporta definition.
+3. Adicionar a definition no array `INTEGRATION_DEFINITIONS` de `marketplace.module.ts`.
+4. **Zero** alteração em: controller, registry, handler, envelope, core, outros providers.
+
+**Não-técnico:** É como comprar um novo aparelho e ligar na tomada. A tomada não muda; só o aparelho é novo.
+
+```mermaid
+graph LR
+    subgraph Core["Core — NÃO muda"]
+        CTRL[WebhookController]
+        REG[Registry]
+        ENV[Envelope]
+        IDM[Idempotência]
+        HAND[EventHandler]
+    end
+
+    subgraph Novo["Novo provider — SÓ isso é novo"]
+        DEF[Nova Definition]
+        ADP[Novo WebhookAdapter]
+        ORD[Novo OrderProvider]
+        MAP[Novo Mapper]
+        MOD[Novo Module]
+    end
+
+    MOD -->|registra em| REG
+    REG -->|resolve| ADP
+    ADP -->|usa| CTRL
+    CTRL -->|publica| ENV
+    ENV --> HAND
+    HAND -->|capability| ORD
+    ORD -->|chama| MAP
+```
 
 ---
 
-## 18. Trade-offs aceitos (assinados)
+## 7. Checklist de sucesso do spike
 
-- **`(type, providerId)` composta:** mais verboso, paga em autorização e organização de módulo. Aceito.
-- **Envelope com `correlationId`/`causationId`/metadados:** mais campos, porém essenciais em produção para debug distribuído. Aceito.
-- **Canonical model com `providerData` escape hatch:** menos "puro", evita perda de dado. Aceito.
-- **Registry por token nomeado + array explícito (em vez de self-registration `onModuleInit`):** consistente com o monorepo e pegável em compile-type. Aceito.
-- **Mapeamento completo fora do HTTP path:** latência e acoplamento vão para o consumer assíncrono retry-ável. Aceito.
-- **Conector genérico só para o perfil comum:** cobre o long tail sem puxar um framework universal. Aceito.
+- [ ] Rota única `/webhooks/:type/:provider` atende Tray, Shopify e WhatsApp.
+- [ ] Nenhum `if (providerName === "tray")` fora de `src/providers/**`.
+- [ ] Novo provider = 1 diretório + 1 linha no array de definitions.
+- [ ] `rawBody` preservado; HMAC da Shopify valida byte a byte.
+- [ ] Segredo por instância (`instance.credentials.webhookSecret`), não env global.
+- [ ] `idempotencyKey` determinística: retry gera `[idempotent] skip`.
+- [ ] Consumer usa `def.capabilities.orders`, nunca `providerName`.
+- [ ] `providerData` guarda campos exclusivos sem poluir `CanonicalOrder`.
+- [ ] Curva medida: 4º provider exige menos alterações que o 2º.
 
 ---
 
-## 19. Critérios de sucesso / o que medir
+## 8. Riscos e como mitigar
 
-- **Tempo de um novo provider:** métrica de processo (ex.: P50 < X dias da 5ª integração em diante).
-- **Linhas tocadas no core por integração nova:** deve ser `0` (guard em CI).
-- **Testes de contrato por provider:** `registry.get(type, id)` retorna as capabilities esperadas; `mapper.toCanonical(fixture)` bate com snapshot — rodando isoladamente, sem entender os outros 19 (é isso que garante a 20ª integração barata).
-- **Webhook HTTP no SLA:** p99 < 100ms, nada de chamada externa no path.
-- **Sem `if (providerId === 'tray')`** fora do módulo do provider (grep como alerta de regressão).
+| Risco | Mitigação |
+|---|---|
+| **Abstração cedo demais** | As 3 primeiras integrações são manuais. Conector genérico só depois. |
+| **Capability vira plano de assinatura** | Config de plano vive em `IntegrationInstance.config`, nunca no `CapabilitySet`. |
+| **Campos exclusivos viram canônicos** | Regra dos 2 providers: só sobe se 2+ tiverem equivalência semântica real. |
+| **Secret global vaza entre tenants** | Secret por instância + `timingSafeEqual`. |
+| **Webhook público sem proteção** | `@Public` + `@WebhookThrottler` + limite de body. |
+| **Core cresce com exceções** | Se um provider precisar de comportamento novo, crie uma capability nova, não modifique uma existente. |
+
+---
+
+## 9. O que apresentar para a empresa
+
+### Slide 1 — O problema
+
+> Cada integração nova hoje é um projeto. A 10ª custa igual à 1ª.
+
+### Slide 2 — A virada
+
+> Em vez de perguntar "isso é da Tray?", o sistema pergunta "quem sabe entregar pedidos?". Novo parceiro entra pela mesma porta.
+
+### Slide 3 — A prova de conceito
+
+> 3 providers (Tray, Shopify, WhatsApp), 3 validações diferentes, 1 rota só. Nenhum código do core muda entre eles.
+
+### Slide 4 — A curva de esforço
+
+| Integração | Esforço |
+|---|---|
+| 1ª (Tray) | Alto — constrói o tabuleiro |
+| 2ª (Shopify) | Médio — primeira peça nova |
+| 3ª (WhatsApp) | Baixo — peça segue o molde |
+| 4ª em diante | Mecânico — só o que é genuíno do provider |
+
+### Slide 5 — O investimento
+
+> Spike de 4–5 semanas para validar a tese. Se falhar, o custo é baixo e a lição é clara. Se funcionar, a 20ª integração será mais barata que a 2ª.
+
+---
+
+## 10. Resumo para você raciocinar
+
+1. **Comece pelo tabuleiro:** core + Tray. Não tente generalizar antes.
+2. **Adicione peças que provam variação:** Shopify (HMAC) e WhatsApp (challenge).
+3. **Meça a curva:** o 4º provider deve ser mecânico.
+4. **Só depois pense em conector genérico, Kafka obrigatório ou microserviços extras.**
+5. **Regra de ouro:** se adicionar um provider exigir mexer no core, o plugue está errado — ajuste o formato do plugue, não dê um jeito.
+
+---
+
+**Documentos de referência:**
+- `/marketplace-integrations-apresentacao.md` — versão não-técnica.
+- `/marketplace-integrations-arquitetura.md` — arquitetura DataCrazy.
+- `/marketplace-integrations-tecnico.md` — contratos e código de referência.
+- `/marketplace/` — MVP executável.
+- `/integration-platform-arquitetura (1).md` — crítica e refinamento da proposta.
