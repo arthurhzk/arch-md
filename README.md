@@ -422,13 +422,3 @@ export class CrmModule {}
 | Campos exclusivos viram canônicos | Regra dos 2 providers: só sobe se 2+ tiverem equivalência semântica |
 | Webhook público sem proteção | `@Public` + `@WebhookThrottler` + validação de assinatura por provider |
 
----
-
-## 15. Próximos Passos Recomendados
-
-1. Implementar HMAC real da Shopify.
-2. Fazer `TrayOrderAdapter` chamar a API Tray e retornar `CanonicalOrder`.
-3. Substituir idempotência em memória por persistência.
-4. Publicar envelope canônico no Kafka/event bus.
-5. Adicionar testes para `WebhookOrchestratorService` e `CreateUpdateIntegrationCommandHandler`.
-6. Medir esforço do 4º provider para validar a curva de adoção.
