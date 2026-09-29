@@ -1,159 +1,173 @@
-# Integrações Atualizadas — Proposta de Arquitetura
+# Spike: Marketplace Integrations Architecture
 
-> **Status:** spike em andamento  
-> **Local no CRM:** `src/modules/integrations-updated`  
-> **Base conceitual:** adaptação da proposta `spike-marketplace-proposta.md` para os padrões de arquitetura do CRM.
-
----
-
-## 1. Resumo Executivo (não-técnico)
-
-Hoje cada integração nova no CRM exige mexer em vários pontos do sistema: controller de webhook, validação de campos, repositório, mapeamento de payload. Isso deixa o código difícil de manter e cada parceiro novo vira um projeto.
-
-A proposta **Integrações Atualizadas** transforma o CRM numa **plataforma plug-and-play de integrações**:
-
-- O núcleo define **tomadas-padrão** (contratos).
-- Cada parceiro é um **módulo plugável** que encaixa nessas tomadas.
-- Para adicionar um novo parceiro, você cria apenas um novo diretório de provider.
-- O controller de webhook é **único** para todos os parceiros.
-- Todo payload estrangeiro é traduzido para uma **lingua franca** (modelos canônicos) antes de seguir para o resto do CRM.
-
-**Metáfora:** em vez de construir um cômodo novo na casa para cada aparelho, a casa já tem tomadas-padrão na parede e cada aparelho traz seu próprio plugue.
+> **Status:** spike concluído — decisões arquiteturais validadas  
+> **Branch:** `feat/spike-integrations-arch`  
+> **Implementação de referência:** `src/services/crm/src/modules/integrations-updated`  
+> **Escopo implementado:** webhook (verificação, parse, idempotência, publicação por tipo),
+> custom fields com validação Zod, fluxo de autenticação em 2 passos e redação de tokens.  
+> **Sem commit:** as mudanças deste doc e do código de referência ainda não foram commitadas.
 
 ---
 
-## 2. Problema (por que mudar?)
+## 1. Objetivo
 
-No módulo `integrations` atual:
+Definir uma arquitetura plug-and-play para integrações de marketplace (Tray, Shopify, Yampi, etc.) no CRM, onde:
 
-- Lógica de webhook espalhada por controllers (`tray`, `wavoip`, `api4com`, `facebook`).
-- Validação de campos feita de forma manual e inconsistente.
-- Payloads de parceiros diferentes chegam ao resto do CRM em formatos diferentes.
-- Adicionar um novo parceiro exige tocar controller, handlers, mapeamentos e repositórios.
-- Campos específicos de um parceiro sujam o modelo padrão ou ficam escondidos em JSONs sem schema.
+- O núcleo é genérico e não muda entre providers.
+- Cada provider é um plugue isolado em seu próprio diretório.
+- Webhooks de todos os providers entram por uma rota única.
+- Payloads estrangeiros são traduzidos para modelos canônicos antes de seguir para o resto do sistema.
+- Providers que precisam de autenticação/tokens (Tray) têm seu próprio fluxo; providers webhook-only (Yampi) não precisam.
 
 ---
 
-## 3. Solução Proposta
+## 2. Princípios
 
-### 3.1 Visão de alto nível
+1. **Núcleo fechado, providers abertos.** Se adicionar um provider exigir mudar controller, registry ou outro provider, o plugue está errado.
+2. **Canônico onde faz sentido, específico onde não dá.** Não forçar equivalências semânticas entre providers distintos.
+3. **Autenticação é uma capability, não uma obrigatoriedade.** Yampi não precisa de token; Tray precisa.
+4. **Rotas específicas de API vivem em clients concretos por provider.** Não tentar abstrair `GET /orders`, `GET /products`, `GET /customers` numa interface única.
 
-```mermaid
-graph TB
-    subgraph HTTP["HTTP Edge"]
-        WC[WebhookController<br/>rota única]
-        IC[IntegrationsUpdatedController<br/>CRUD]
-    end
+---
 
-    subgraph Core["Núcleo do CRM — não muda entre providers"]
-        REG[IntegrationProviderRegistry]
-        ORC[WebhookOrchestratorService]
-        IDM[WebhookIdempotencyService]
-        ENV[MarketplaceWebhookEnvelope]
-    end
+## 3. Arquitetura
 
-    subgraph Ports["Contratos / Ports"]
-        WEB[WebhookAdapter]
-        ORD[OrderAdapter]
-        CF[CustomFieldsAdapter]
-        AUTH[AuthenticationAdapter]
-        IP[IntegrationProvider]
-    end
+### 3.1 Capabilities
 
-    subgraph Providers["Providers plugáveis"]
-        TRAY[Tray]
-        SHO[Shopify]
-        WHA[WhatsApp]
-    end
+Cada provider declara o que sabe fazer:
 
-    subgraph Data["Dados"]
-        INT[(IntegrationEntity)]
-    end
-
-    WC --> ORC
-    ORC --> REG
-    ORC --> IDM
-    ORC --> ENV
-    REG --> IP
-    IP --> WEB
-    IP --> ORD
-    IP --> CF
-    TRAY --> WEB
-    TRAY --> ORD
-    TRAY --> CF
-    SHO --> WEB
-    SHO --> ORD
-    WHA --> WEB
-    IC --> INT
-    ORC --> INT
+```ts
+export interface ProviderCapabilitySet {
+    webhook?: WebhookAdapter;
+    auth?: AuthenticationAdapter;        // opcional — só quem usa token
+    customFields?: CustomFieldsAdapter;
+}
 ```
 
-### 3.2 Regra de ouro
+> **Removido nesta revisão:** `orders?: OrderAdapter`. A busca de pedido ficou fora do
+> registry de capabilities — é responsabilidade de outro módulo e acontece por `TrayApiClient`
+> (ver 3.4). Um `OrderAdapter` genérico só criava uma interface com um método que cada
+> provider implementaria de um jeito diferente.
 
-> Para adicionar um provider novo, você só cria um novo diretório em `infra/providers/<novo>/`.  
-> Se precisar abrir o núcleo ou mexer em outro provider, o formato do plugue está errado.
+### 3.2 Ports (contratos do núcleo)
 
----
+```ts
+export abstract class WebhookAdapter {
+    abstract verifySignature(input: WebhookVerificationInput): boolean | Promise<boolean>;
+    abstract parse(input: WebhookVerificationInput): WebhookParseResult | Promise<WebhookParseResult>;
+    verifyChallenge?(input: WebhookVerificationInput): string | undefined | Promise<string | undefined>;
+}
 
-## 4. Arquitetura Técnica
+export abstract class AuthenticationAdapter {
+    abstract authenticate(credentials: Record<string, string>): Promise<Record<string, unknown>>;
+    abstract extractExternalId(authResult: Record<string, unknown>): string | undefined;
+    abstract refresh(integration: Integration): Promise<Record<string, unknown>>;
+}
 
-### 4.1 Estrutura de pastas (padrão CRM)
+export abstract class IntegrationProvider {
+    abstract readonly providerId: string;
+    abstract readonly type: IntegrationType;
+    abstract readonly displayName: string;
+    abstract readonly capabilities: ProviderCapabilitySet;
 
+    abstract toEnvelope(payload, integration): MarketplaceWebhookEnvelope | Promise<MarketplaceWebhookEnvelope>;
+
+    toCanonicalWebhookPayload?(envelope): Record<string, unknown> | Promise<Record<string, unknown>>;
+}
+
+export abstract class CustomFieldsAdapter {
+    abstract readonly schema: CustomFieldSchema;
+    abstract extract(source: Record<string, unknown>): Record<string, unknown>;
+}
 ```
-src/modules/integrations-updated/
-├── application/
-│   ├── commands/              # CQRS: create-update, delete, receive-webhook
-│   ├── queries/               # CQRS: find-all, find-by-id, find-definitions
-│   ├── controllers/           # IntegrationsUpdatedController + WebhookController
-│   ├── dtos/                  # DTOs de entrada/saída + schemas Zod
-│   ├── maps/                  # Automapper profiles
-│   └── services/              # IntegrationProviderRegistry, WebhookOrchestratorService, etc.
-├── domain/
-│   ├── entities/              # Integration, IntegrationDefinition
-│   ├── enums/                 # IntegrationType
-│   ├── repositories/          # IntegrationRepository + ports (IntegrationProvider, adapters)
-│   └── value-objects/         # CanonicalOrder, CanonicalMessage, Envelope, CustomFieldSchema
-├── infra/
-│   ├── repositories/          # IntegrationPrismaRepository
-│   └── providers/             # Tray, Shopify, WhatsApp
-└── integrations-updated.module.ts
+
+O provider **não** publica evento. Ele só traduz o envelope para o payload canônico
+(quando faz sentido); quem decide o formato do evento é o `WebhookEventPublisher` (ver 3.6).
+
+### 3.3 Helper genérico de token refresh
+
+Token refresh é cross-cutting, mas a lógica de refresh é provider-specific. Solução:
+
+```ts
+// domain/helpers/execute-with-fresh-token.ts
+export async function executeWithFreshToken<T>(
+    integration: Integration,
+    authAdapter: AuthenticationAdapter,
+    execute: (fields: Record<string, unknown>) => Promise<T>,
+    maxRetries: number = 1
+): Promise<T> {
+    // tenta executar; em 401 chama authAdapter.refresh() e tenta de novo
+}
 ```
 
-### 4.2 Camadas
+Cada `AuthenticationAdapter` implementa seu próprio `refresh`. O helper só orquestra retry + refresh.
 
-| Camada | Responsabilidade | Exemplo |
-|---|---|---|
-| **Domain** | Regras de negócio puras, entidades, contratos | `Integration`, `IntegrationProvider`, `CanonicalOrder` |
-| **Application** | Orquestra casos de uso, CQRS, controllers | `CreateUpdateIntegrationCommandHandler`, `WebhookOrchestratorService` |
-| **Infra** | Implementa detalhes técnicos (Prisma, HTTP, HMAC) | `IntegrationPrismaRepository`, `TrayWebhookAdapter` |
+### 3.4 Clients específicos por provider
 
-### 4.3 Ports e Adapters
+Não forçar todas as operações de API numa interface genérica. Cada provider expõe seu próprio client:
 
-O núcleo define **ports** (interfaces) em `domain/repositories/integration-provider.port.ts`:
+```ts
+@Injectable()
+export class TrayApiClient {
+    constructor(private readonly authAdapter: TrayAuthenticationAdapter) {}
 
-- `IntegrationProvider` — representa um parceiro (type, providerId, capabilities)
-- `WebhookAdapter` — valida assinatura, faz parse, extrai idempotency key, responde challenge
-- `OrderAdapter` — busca pedido no parceiro e converte para `CanonicalOrder`
-- `CustomFieldsAdapter` — declara e extrai campos personalizados do provider
-- `AuthenticationAdapter` — estratégias de autenticação (OAuth2, API key, etc.)
+    async getOrder(orderId: string, integration: Integration): Promise<TrayOrder | undefined> { ... }
+    async listOrderStatuses(integration: Integration): Promise<TrayOrderStatus[]> { ... }
+    async listOrderStatusesWithFields(fields: TrayIntegrationFields): Promise<TrayOrderStatus[]> { ... }
+}
+```
 
-Cada provider em `infra/providers/<nome>/` entrega as implementações concretas desses ports.
+O `TrayApiClient` usa `executeWithFreshToken` internamente. Outros módulos importam `TrayApiClient` e chamam métodos específicos.
 
----
+O `listOrderStatusesWithFields` existe porque `listOrderStatuses(integration)` **não roda no
+passo `connect`**: o helper depende de `integration.fields`, e no connect ainda não existe
+integração — só `code`, `storeDomain` e o `accessToken` novo. A versão por fields não usa o
+helper, porque nesse ponto não há o que renovar.
 
-## 5. Modelos Canônicos
+### 3.5 Modelos canônicos
 
-### 5.1 Por que canônico?
+#### Envelope de webhook
 
-Cada parceiro fala um dialeto diferente. A Tray envia `orderId` + `sellerId` + `act`. A Shopify envia `id` + `line_items` + `financial_status`. O WhatsApp envia `messages[0].id` + `from` + `text.body`.
+```ts
+interface MarketplaceWebhookEnvelope {
+    eventId: string;
+    eventType: string;        // "order.inserted", "message.received"
+    version: number;
+    integrationType: IntegrationType;
+    providerName: string;
+    providerId: string;
+    tenantId: string;
+    correlationId: string;
+    idempotencyKey: string;
+    occurredAt: Date;
+    receivedAt: Date;
+    metadata: Record<string, unknown>;
+    payload: Record<string, unknown>;
+}
+```
 
-Se o CRM precisar entender cada dialeto, o código vira um espaguete de `if (provider === "tray")`. Os **modelos canônicos** são a tradução para uma lingua franca.
+#### Payload canônico de webhook
 
-### 5.2 `CanonicalOrder`
+```ts
+interface CanonicalWebhookPayload {
+    externalEventId?: string;
+    externalOrderId?: string;
+    externalSellerId?: string;
+    externalCustomerId?: string;
+    externalScopeId?: string;
+    scope?: string;
+    action?: string;
+    providerData?: unknown;   // escape hatch com dados brutos
+}
+```
+
+Cada provider mapeia seu payload bruto para `CanonicalWebhookPayload` antes de publicar no Kafka.
+
+#### Pedido canônico
 
 ```ts
 interface CanonicalOrder {
-    externalId: string;            // id do pedido no parceiro
+    externalId: string;
     tenantId: string;
     providerName: string;
     providerId: string;
@@ -163,87 +177,234 @@ interface CanonicalOrder {
     customer: { name?: string; email?: string };
     createdAt: Date;
     updatedAt: Date;
-    customFields?: Record<string, unknown>;  // campos declarados pelo provider
-    providerData?: unknown;                  // escape hatch
+    customFields?: Record<string, unknown>;
+    providerData?: unknown;
 }
 ```
 
-### 5.3 `MarketplaceWebhookEnvelope`
+`CanonicalOrder` continua existindo como modelo, mas **não** é mais buscado por capability —
+quem enriquece pedido usa o client concreto do provider.
 
-Toda mensagem, venha de quem vier, é reescrita num envelope padrão:
+### 3.6 Publicação de eventos por tipo
+
+Publicação não mora no provider. O `WebhookEventPublisher` é genérico e despacha pelo
+`IntegrationType`:
 
 ```ts
-interface MarketplaceWebhookEnvelope {
-    eventId: string;
-    eventType: string;             // ex: "order.created", "message.received"
-    version: number;
-    integrationType: IntegrationType;
-    providerName: string;
+// domain/repositories/integration-webhook-event-publisher.port.ts
+export interface WebhookEventContext {
+    envelope: MarketplaceWebhookEnvelope;
+    integration: Integration;
     providerId: string;
-    tenantId: string;
-    correlationId: string;
-    idempotencyKey: string;        // hash determinístico
-    occurredAt: Date;
-    receivedAt: Date;
-    metadata: Record<string, unknown>;
-    payload: Record<string, unknown>;
+    canonicalPayload: Record<string, unknown>;
+}
+
+export abstract class IntegrationWebhookEventPublisher {
+    abstract readonly type: IntegrationType;
+    abstract toEvent(context: WebhookEventContext): DomainEvent | undefined | Promise<DomainEvent | undefined>;
 }
 ```
 
----
-
-## 6. Campos Personalizados (Custom Fields)
-
-Cada provider pode declarar campos extras que não existem no `CanonicalOrder` base.
-
-### 6.1 Exemplo: Tray
+Cada tipo registra a sua própria implementação, que é dona do **formato do evento** e da
+extração dos campos que só ele entende:
 
 ```ts
-class TrayCustomFieldsAdapter extends CustomFieldsAdapter {
-    readonly schema = {
-        fields: [
-            { key: "scopeName", label: "Escopo", type: "string" },
-            { key: "sellerName", label: "Loja", type: "string" },
-            { key: "commission", label: "Comissão", type: "number" }
-        ]
-    };
+// infra/publishers/ecommerce/ecommerce-webhook-event.publisher.ts
+@Injectable()
+export class EcommerceWebhookEventPublisher extends IntegrationWebhookEventPublisher {
+    readonly type = IntegrationType.ECOMMERCE;
+
+    toEvent({ envelope, integration, providerId, canonicalPayload }: WebhookEventContext) {
+        const fields = integration.fields as { storeDomain?: string; scopes?: unknown } | undefined;
+
+        return createEcommerceWebhookKafkaEvent({
+            tenantId: integration.tenantId,
+            integrationId: integration.id,
+            provider: providerId,
+            storeId: integration.providerId,
+            storeDomain: fields?.storeDomain ?? "",
+            resourceId: this.resolveResourceId(canonicalPayload),
+            event: envelope.eventType,
+            payload: canonicalPayload,
+            receivedAt: envelope.receivedAt.getTime(),
+            scopes: fields?.scopes ?? []
+        });
+    }
 }
 ```
 
-### 6.2 Separação
+O dispatcher registra as implementações no mesmo padrão de `INTEGRATION_PROVIDERS`:
 
-| Tipo de campo | Onde fica | Exemplo |
-|---|---|---|
-| Comum a todos os providers | `CanonicalOrder` direto | `externalId`, `status`, `total` |
-| Só esse provider tem, mas queremos padronizar | `customFields` | `scopeName`, `commission` (Tray) |
-| Totalmente específico, sem equivalência | `providerData` | JSON bruto ou campos raros |
+```ts
+export const integrationWebhookEventPublisherClasses = [EcommerceWebhookEventPublisher];
 
----
-
-## 7. Fluxo do Webhook
-
-### 7.1 Rota única
-
-```
-GET/POST /api/crm/integrations-updated/webhooks/:type/:provider/:integrationId
+{
+    provide: "INTEGRATION_WEBHOOK_EVENT_PUBLISHERS",
+    useFactory: (...publishers) => publishers,
+    inject: integrationWebhookEventPublisherClasses as any
+}
 ```
 
-### 7.2 Sequência
+**Dois gates de saída, ambos silenciosos (decisão conscious):**
+
+1. `integration.type` sem publisher registrado → nada é publicado.
+2. provider sem `toCanonicalWebhookPayload` → nada é publicado.
+
+O segundo gate é proposital: sem mapeamento canônico não existe payload canônico, e
+publicar o payload cru mascarado de canônico seria pior do que não publicar.
+
+> **Hoje:** só `ECOMMERCE` tem publisher. `MESSAGING` é aceito pelo webhook e descartado sem
+> log — o orchestrator ainda responde `status: "processed"`. Isso é uma lacuna conhecida
+> (ver seção 10).
+
+### 3.7 Fluxo de autenticação (connect + confirm)
+
+O `AuthenticationAdapter` sabe *como* autenticar num provider, mas nada orquestrava *quando*.
+O `IntegrationAuthService` é a peça que faltava e é genérico, em dois passos:
 
 ```mermaid
 sequenceDiagram
-    participant Provider as Parceiro (Tray/Shopify/WhatsApp)
+    participant FE as Front
+    participant WC as IntegrationsUpdatedController
+    participant SVC as IntegrationAuthService
+    participant REG as ProviderRegistry
+    participant ADP as AuthenticationAdapter
+    participant RDS as Redis
+
+    FE->>WC: POST /:type/:providerId/auth/connect { credentials }
+    WC->>SVC: connect(...)
+    SVC->>REG: resolve(type, providerId)
+    REG-->>SVC: IntegrationProvider
+    SVC->>SVC: valida campos com auth: true
+    SVC->>ADP: authenticate(credentials)
+    ADP-->>SVC: campos + tokens
+    SVC->>ADP: extractExternalId(authResult)
+    ADP-->>SVC: storeId
+    SVC->>SVC: redige campos sensitive
+    SVC->>RDS: stageia { externalId, fields, tenantId } TTL 15min
+    SVC-->>FE: { connectionId, providerId, safeData }
+
+    Note over FE,RDS: o usuário termina o wizard
+
+    FE->>WC: POST /:type/:providerId/auth/confirm?connectionId=...
+    WC->>SVC: confirm(connectionId, integrationId?)
+    SVC->>RDS: lê o stage
+    SVC->>SVC: trava tenant
+    SVC->>SVC: lock por externalId
+    alt integrationId
+        SVC->>SVC: valida tenant e externalId da integração
+        SVC->>SVC: merge fields + update
+    else não
+        SVC->>SVC: valida fields no schema Zod + create
+    end
+    SVC->>RDS: remove o stage
+    SVC-->>FE: IntegrationDto (fields redigidos)
+```
+
+O passo `connect` não persiste nada de propósito: o usuário pode abandonar o wizard sem
+deixar integração pela metade no banco.
+
+**Por que `extractExternalId` é método do adapter e não um campo do resultado.** O
+`providerId` da integração tem que ser o id do recurso no provider (o `store_id` da Tray).
+Sem isso o núcleo teria que adivinhar uma chave no `Record<string, unknown>` devolvido.
+Deixar o provider extrair também permite que ele valide o que veio na resposta — a Tray
+devolve `api_host`, e o legado validava esse host antes de persistir.
+
+**Três invariantes no `confirm`, todas pré-condição de escrita:**
+
+1. **Tenant** — o stage carrega o `tenantId` de quem autenticou. Se não bater com a sessão
+   atual, recusa. `SessionContext.get().tenantId` devolve `""` fora de sessão, então sessão
+   vazia também recusa (senão `"" !== ""` passaria).
+2. **`externalId` da integração** — só atualiza se o recurso autenticado for o mesmo da
+   integração. Sem isso, um tenant confirmaria a loja de outro reaproveitando um `connectionId`.
+3. **Store já integrada** — se já existe integração com aquele `externalId` e de outro tenant,
+   recusa; se for do mesmo tenant, reaproveita em vez de duplicar.
+
+**Redação de tokens.** Tudo que o schema marca como `sensitive` sai do `safeData` devolvido
+no `connect` e de toda resposta `Integration -> IntegrationDto` (ver seção 4).
+
+**Ciclo de DI evitado.** A Tray precisa dos status de pedido no `connect`, porque `scopes` é
+campo `required` do schema dela. O `TrayApiClient` injeta o `TrayAuthenticationAdapter`, então
+o adapter não pode injetar o client de volta. A chamada bruta ficou numa função
+(`tray.api.requests.ts`) usada pelos dois lados, em vez de `forwardRef` ou GET duplicado.
+
+---
+
+## 4. Custom Fields
+
+Cada provider declara seus campos. Adicionamos metadados para o front:
+
+```ts
+export interface CustomFieldDefinition {
+    key: string;
+    label: string;
+    type: "string" | "number" | "boolean" | "date" | "json";
+    required?: boolean;
+    description?: string;
+    sensitive?: boolean;       // mascara no front
+    serverManaged?: boolean;   // não editável
+    auth?: boolean;            // parte do fluxo de autenticação
+}
+```
+
+Exemplo Tray:
+
+```ts
+{ key: "storeDomain", label: "Domínio da loja", type: "string", required: true },
+{ key: "code", label: "Código de autorização", type: "string", required: true, sensitive: true, auth: true },
+{ key: "accessToken", label: "Access Token", type: "string", required: true, sensitive: true, serverManaged: true, auth: true },
+{ key: "refreshToken", label: "Refresh Token", type: "string", required: true, sensitive: true, serverManaged: true, auth: true },
+```
+
+Validação com Zod é gerada a partir do schema:
+
+```ts
+export function buildCustomFieldsSchema(schema: CustomFieldSchema): z.ZodType<Record<string, unknown>> {
+    // mapeia tipos para zod, coerção, required, strict
+}
+```
+
+### `sensitive` agora tem efeito
+
+O flag existia só como metadado para o front e não era usado para nada no backend — `GET
+/integrations-updated` devolvia `accessToken` e `refreshToken` em texto puro, assim como as
+respostas de `POST` e `PUT`. Agora a redação acontece no profile do Automapper, que é o
+único ponto por onde passa todo `Integration -> IntegrationDto`:
+
+```ts
+createMap(
+    mapper,
+    Integration,
+    IntegrationDto,
+    forMember((destination) => destination.fields, mapFrom((source) => this.fieldsRedactor.redact(source)))
+);
+```
+
+O redactor usa a **união das chaves `sensitive` de todos os providers registrados**, não o
+schema do provider da integração. É proposital: falha para o lado seguro. Redigir um campo a
+mais só atrapalha o front de repopular o formulário; vazar um token é incidente.
+
+---
+
+## 5. Fluxo do Webhook
+
+```mermaid
+sequenceDiagram
+    participant Provider as Parceiro
     participant WC as WebhookController
     participant ORC as WebhookOrchestratorService
     participant REG as ProviderRegistry
     participant ADP as WebhookAdapter
-    participant IDM as IdempotencyService
+    participant IDM as WebhookIdempotencyService
+    participant PUB as WebhookEventPublisher
+    participant TPUB as Publisher do tipo
+    participant ADP as Provider
 
-    Provider->>WC: POST /webhooks/ECOMMERCE/tray/:id
+    Provider->>WC: POST /webhooks/:type/:provider/:id/:secret?
     WC->>ORC: handle(...)
     ORC->>REG: resolve(type, providerId)
     REG-->>ORC: IntegrationProvider
-    ORC->>ADP: verifySignature(req, integration)
+    ORC->>ADP: verifySignature(req)
 
     alt assinatura inválida
         ADP-->>ORC: false
@@ -252,173 +413,219 @@ sequenceDiagram
         ADP-->>ORC: true
         ORC->>ADP: parse(req)
         ADP-->>ORC: WebhookParseResult
-        ORC->>IDM: já processou?
+        ORC->>IDM: tryMarkAsProcessed(key)
 
         alt já processado
-            IDM-->>ORC: sim
+            IDM-->>ORC: false
             ORC-->>Provider: 200 { status: "idempotent" }
         else novo evento
-            IDM-->>ORC: não
+            IDM-->>ORC: true
             ORC->>ORC: monta MarketplaceWebhookEnvelope
-            ORC->>IDM: markAsProcessed(key)
+            ORC->>PUB: publish(envelope, integration, provider)
+            PUB->>PUB: resolve publisher por integration.type
+
+            alt sem publisher para o tipo
+                PUB-->>ORC: nada publicado
+            else
+                PUB->>ADP: toCanonicalWebhookPayload(envelope)
+
+                alt provider sem mapeamento canônico
+                    ADP-->>PUB: undefined
+                    PUB-->>ORC: nada publicado
+                else
+                    ADP-->>PUB: CanonicalWebhookPayload
+                    PUB->>TPUB: toEvent({ envelope, integration, providerId, canonicalPayload })
+                    TPUB-->>PUB: DomainEvent
+                    PUB->>PUB: eventBus.publish(event)
+                end
+            end
+
             ORC-->>Provider: 200 { status: "processed" }
         end
     end
 ```
 
-### 7.3 Challenge GET (WhatsApp)
+### Idempotência
 
-```mermaid
-sequenceDiagram
-    participant Provider as WhatsApp
-    participant WC as WebhookController
-    participant ORC as WebhookOrchestratorService
-    participant ADP as WhatsappWebhookAdapter
-
-    Provider->>WC: GET /webhooks/MESSAGING/whatsapp/:id?hub.challenge=123
-    WC->>ORC: handle(...)
-    ORC->>ADP: verifyChallenge(req)
-    ADP-->>ORC: "123"
-    ORC-->>Provider: 200 123
-```
-
----
-
-## 8. CRUD de Integrações
-
-### 8.1 Endpoints
-
-| Método | Rota | Descrição |
-|---|---|---|
-| GET | `/integrations-updated/definitions` | Lista providers registrados |
-| GET | `/integrations-updated` | Lista integrações do tenant |
-| GET | `/integrations-updated/:id` | Busca uma integração |
-| POST | `/integrations-updated` | Cria integração |
-| PUT | `/integrations-updated/:id` | Atualiza integração |
-| DELETE | `/integrations-updated/:id` | Remove integração (soft delete) |
-
-### 8.2 Validação com Zod
-
-A criação/alteração de integração é validada com Zod antes de tocar no domínio:
+Usa Redis com `INCR` atômico:
 
 ```ts
-export const createUpdateIntegrationSchema = z.object({
-    id: z.string().uuid().optional(),
-    name: z.string().min(1).max(255),
-    type: z.nativeEnum(IntegrationType),
-    active: z.boolean().optional(),
-    providerId: z.string().min(1).max(255),
-    fields: z.record(z.unknown()).default({})
-});
+async tryMarkAsProcessed(key: string): Promise<boolean> {
+    const count = await this.cacheManager.publicIncrement(key, 1, ttl);
+    return count === 1;
+}
 ```
 
-Além disso, o handler resolve o provider e valida os campos contra o schema de `customFields` daquele provider. Campos desconhecidos são rejeitados.
+### Publicação no Kafka
+
+O provider não publica. Ele devolve o payload canônico e o `WebhookEventPublisher` delega
+o formato do evento ao publisher do tipo. Ver 3.6.
+
+```ts
+// no provider — só tradução
+toCanonicalWebhookPayload(envelope): Record<string, unknown> {
+    if (envelope.payload.scopeName !== "order") return {};
+    return { externalOrderId: ..., providerData: ... };
+}
+```
 
 ---
 
-## 9. Providers de Exemplo
+## 6. Rota com Secret Opcional
 
-### 9.1 Tray (e-commerce)
+A rota suporta secret global opcional no path:
 
-- Validação por segredo na URL (`?secret=...`)
-- Capabilities: webhook, orders, customFields
-- Eventos: `order.created`, `order.paid`, etc.
+```
+POST /integrations-updated/webhooks/:type/:provider/:integrationId
+POST /integrations-updated/webhooks/:type/:provider/:integrationId/:secret
 
-### 9.2 Shopify (e-commerce)
+GET /integrations-updated/webhooks/:type/:provider/:integrationId
+GET /integrations-updated/webhooks/:type/:provider/:integrationId/:secret
+```
 
-- Validação por HMAC-SHA256 do `rawBody`
-- Capabilities: webhook, orders
-- Placeholder para validação real
-
-### 9.3 WhatsApp (mensageria)
-
-- Challenge GET para verificação
-- Validação de assinatura (placeholder)
-- Eventos: `message.received`
+O `secret` é repassado para `WebhookVerificationInput.secret`. A Tray, por exemplo, compara com `process.env.TRAY_WEBHOOK_SECRET`.
 
 ---
 
-## 10. O que está pronto vs. o que falta
+## 7. Exemplos de Provider
 
-### 10.1 Pronto
+### 7.1 Tray
 
-- Estrutura de pastas no padrão CRM (`application/`, `domain/`, `infra/`)
-- Entidade `Integration` com métodos de domínio
-- Repositório Prisma com `@EntityTracker`
-- CQRS: commands, queries, controllers, DTOs, Automapper profile
-- Registry de providers
-- Webhook controller funcional com challenge, validação, parse, idempotência e envelope
-- Rota única de webhook
-- Modelos canônicos (`CanonicalOrder`, `CanonicalMessage`, `MarketplaceWebhookEnvelope`)
-- Custom fields declarativos por provider
-- Validação de criação com Zod
-- Providers de exemplo: Tray, Shopify, WhatsApp
+Capabilities: `webhook`, `auth`, `customFields`
 
-### 10.2 Falta para produção
+- Webhook: valida `secret` do path contra env var; parseia payload Tray
+- Auth: OAuth com code → tokens; `extractExternalId` devolve o `store_id`; refresh com lock
+- `authenticate()` também busca os status de pedido, porque `scopes` é `required` no schema
+- Usa o `api_host` **da resposta** do auth, não o host do request (o legado validava esse host)
+- Publica: implementa `toCanonicalWebhookPayload` para scope `order`; o evento é montado
+  pelo `EcommerceWebhookEventPublisher`
 
-- Implementar HMAC real da Shopify
-- Implementar chamadas de API externas nos `OrderAdapter`s
-- Persistir idempotência (hoje em memória)
-- Publicar envelope no Kafka/event bus
-- Adicionar testes unitários
-- Criar tabela separada para `IntegrationDefinition` (hoje é entidade em memória)
-- Rate limiting granular por provider
-- DLQ e retry
+### 7.2 Shopify
+
+Capabilities: `webhook`
+
+- Webhook: valida HMAC-SHA256 do `rawBody`
+- Sem auth adapter inicial (pode usar API token depois)
+- **Sem** `toCanonicalWebhookPayload` — o adapter ainda é stub (HMAC em TODO), então não há
+  mapeamento canônico confiável. Publicação só entra quando o mapeamento for feito de fato.
+
+### 7.3 WhatsApp
+
+Capabilities: `webhook`
+
+- Webhook: challenge GET + validação de assinatura
+- Sem auth, sem customFields
+- Não publica: é `MESSAGING` e não há publisher para esse tipo
+
+### 7.4 Yampi (futuro)
+
+Capabilities: `webhook`, `customFields`
+
+- Tudo vem no payload do webhook
+- Sem auth
+- Precisa implementar `toCanonicalWebhookPayload` para gerar evento
 
 ---
 
-## 11. Como adicionar um novo provider
+## 8. Como Adicionar um Novo Provider
 
 1. Criar `infra/providers/<novo>/`.
-2. Implementar:
-   - `<novo>.webhook.adapter.ts`
-   - `<novo>.order.adapter.ts` (opcional)
+2. Implementar adapters necessários:
+   - `<novo>.webhook.adapter.ts` (obrigatório)
    - `<novo>.custom-fields.adapter.ts` (opcional)
-   - `<novo>.integration-provider.ts`
-3. Adicionar a classe do provider no array `integrationProviderClasses` de `integrations-updated.module.ts`.
-4. **Zero** alteração em controller, registry, handler, envelope ou outros providers.
+   - `<novo>.authentication.adapter.ts` (opcional)
+   - `<novo>.api.client.ts` (opcional — rotas específicas)
+   - `<novo>.integration-provider.ts` (obrigatório)
+3. Implementar `toCanonicalWebhookPayload` no provider, **se** o provider deve gerar evento.
+4. Se o provider tem `authentication.adapter.ts`, os dois métodos são obrigatórios:
+   - `authenticate(credentials)` — recebe só os campos com `auth: true`, devolve os fields a persistir
+   - `extractExternalId(authResult)` — devolve o id do recurso no provider (ex.: `store_id`)
+   - `refresh(integration)` — renova token, com lock
+5. Adicionar a classe do provider no array `integrationProviderClasses` de `integrations-updated.module.ts`.
+5. **Zero** alteração em controller, registry, orchestrator, publisher, envelope ou outros providers.
+
+### Adicionar um novo tipo de integração
+
+1. Adicionar o valor em `IntegrationType`.
+2. Criar o contrato do evento em `libs/events/<tipo>/`.
+3. Criar `infra/publishers/<tipo>/<tipo>-webhook-event.publisher.ts` estendendo
+   `IntegrationWebhookEventPublisher`.
+4. Adicionar a classe no array `integrationWebhookEventPublisherClasses`.
+
+**Zero** alteração no `WebhookEventPublisher` — ele só despacha.
 
 ---
 
-## 12. Como ativar o módulo
+## 9. Decisões do Spike
 
-Adicionar em `src/services/crm/src/crm.module.ts`:
-
-```ts
-import { IntegrationsUpdatedModule } from "./modules/integrations-updated/integrations-updated.module";
-
-@Module({
-    imports: [
-        // ... outros módulos
-        IntegrationsUpdatedModule
-    ]
-})
-export class CrmModule {}
-```
-
----
-
-## 13. Checklist de Validação do Spike
-
-- [x] Rota única de webhook atende Tray, Shopify e WhatsApp
-- [x] Nenhum `if (providerName === "tray")` fora de `infra/providers/**`
-- [x] Novo provider = 1 diretório + 1 linha no array de definitions
-- [x] `rawBody` preservado para HMAC
-- [x] Segredo por instância (`integration.fields.webhookSecret`), não env global
-- [x] `idempotencyKey` determinística
-- [ ] Consumer usa `def.capabilities.orders`, nunca `providerName`
-- [x] `providerData` guarda campos exclusivos sem poluir `CanonicalOrder`
-- [ ] Curva medida: 4º provider exige menos alterações que o 2º
-
----
-
-## 14. Riscos e Mitigações
-
-| Risco | Mitigação |
+| Decisão | Motivação |
 |---|---|
-| Abstração cedo demais | Providers iniciais são manuais; conector genérico só depois de 3–4 implementações |
-| `rawBody: true` global | Necessário para HMAC; em produção pode ser limitado por rota |
-| Idempotência em memória | Spike usa Map; produção deve usar Redis/Prisma |
-| Campos exclusivos viram canônicos | Regra dos 2 providers: só sobe se 2+ tiverem equivalência semântica |
-| Webhook público sem proteção | `@Public` + `@WebhookThrottler` + validação de assinatura por provider |
+| `AuthenticationAdapter.refresh` + helper `executeWithFreshToken` | Refresh é específico do provider, mas retry com refresh é genérico |
+| `TrayApiClient` concreto | Rotas de API são específicas; não dá para abstrair numa interface única |
+| `CanonicalWebhookPayload` | Eventos publicados no Kafka têm estrutura padronizada + `providerData` bruto |
+| Flags `sensitive`, `serverManaged`, `auth` nos custom fields | Front sabe como renderizar/mascarar campos |
+| Idempotência com `INCR` atômico no Redis | Elimina race condition entre `get` e `set` |
+| Secret opcional no path | Alguns providers (Tray) usam secret global na URL |
+| Removido `OrderAdapter` | Uma interface com um método que cada provider implementaria diferente não é abstração, é ceremony. Busca de pedido é de outro módulo e usa o client concreto |
+| Removido `handleWebhookEnvelope` do provider | Provider passou a montar evento Kafka, o que acopla a integração a um contrato de mensageria. Provider agora só traduz payload |
+| Publicação separada por `IntegrationType` | `createEcommerceWebhookKafkaEvent` hardcoded não escala. Cada tipo é dono do formato do seu evento e da extração dos campos que só ele entende (`storeDomain`, `scopes`) |
+| Registry por tipo no mesmo padrão do `IntegrationProviderRegistry` | Dispatcher fica genérico e sem `switch`; adicionar tipo é 1 classe + 1 contrato, sem tocar no publisher |
+| Opt-in via `toCanonicalWebhookPayload` | Sem mapeamento canônico não existe payload canônico. Publicar o payload cru mascarado de canônico é pior que não publicar |
+| Publisher sem evento registrado é ignorado em silêncio | Escolha conscious por ora: não polui log nem propaga erro. **Lacuna:** `MESSAGING` é aceita e descartada sem sinal, e o orchestrator ainda responde `processed` |
+| `AuthenticationAdapter.extractExternalId` no port | O `providerId` da integração é o id do recurso no provider (`store_id` da Tray). Sem esse método o núcleo teria que adivinhar a chave no `Record<string, unknown>`, e o provider perde a chance de validar o que veio na resposta |
+| Auth em 2 passos, com stage em Redis | O front tem wizard (escolher status, nomear). Sem staging, uma integração meio autenticada fica no banco se o usuário desistir. TTL de 15min e chave removida no confirm |
+| Redigir `sensitive` no profile do Automapper | É o único ponto por onde passa todo `Integration -> IntegrationDto`. Redigir em cada handler seria 4 lugares para esquecer |
+| União das chaves `sensitive` de todos os providers | Falha para o lado seguro: redigir demais atrapalha o front, vazar token é incidente |
+| Chamada HTTP bruta em `tray.api.requests.ts` | O adapter busca status de pedido no connect, e o client já injeta o adapter. Uma função compartilhada evita ciclo de DI, `forwardRef` e GET duplicado |
 
+---
+
+## 10. Próximos Passos
+
+1. Implementar HMAC real da Shopify e só então o `toCanonicalWebhookPayload` dela.
+2. Criar consumer do `EcommerceWebhookKafkaEvent` e usar `TrayApiClient` para enriquecer pedidos.
+3. Adicionar testes unitários para `WebhookOrchestratorService` e Zod validation.
+4. Medir esforço do 4º provider para validar curva de adoção.
+5. **Fechar a lacuna de `MESSAGING`:** hoje o webhook é aceito e descartado em silêncio com
+   `status: "processed"`. Decidir entre log de warning, publisher para `MESSAGING`, ou
+   rejeitar o tipo no controller.
+6. **Revisar `marketplace-event.handler.ts`:** pode ter virado código morto depois da
+   extração do `WebhookEventPublisher`.
+7. **Desenhar falha de publicação:** hoje o `INCR` marca o evento como processado **antes**
+   de publicar. Se o `eventBus.publish` lançar, o evento se perde e nem um retry do provider
+   resolve — o segundo request cai em `idempotent`. O `WebhookIdempotencyService.clear(key)`
+   já existe e não está sendo usado: dá para reverter a marcação quando a publicação falha.
+   Falta decidir entre isso, fila de retry, ou DLQ.
+8. **Tipar o retorno de `AuthenticationAdapter.refresh`** (`Record<string, unknown>` ainda
+   exige casts) e `CanonicalWebhookPayload` por evento.
+9. **Testar `IntegrationAuthService`:** é o código com mais invariante de segurança da spike
+   e está sem cobertura. Os casos que importam: tenant diferente no `confirm`, `connectionId`
+   expirado, `externalId` divergente da integração, e store já integrada por outro tenant.
+10. **`authenticate()` da Tray faz 2 chamadas HTTP** (auth + status de pedido) e os `scopes` são
+    `required`. Se os status falharem, o connect inteiro falha. Decidir se vale tolerar e
+    conectar sem scopes, ou se a falha dura é o comportamento certo.
+11. **`storeId` vai para dentro dos fields persistidos** e nunca é lido de lá — só do stage.
+    Funciona, mas é um campo extra no JSON da integração. Vale limpar quando `externalId`
+    tiver uso próprio.
+
+---
+
+## 11. Código de Referência
+
+- Registry: `application/services/integration-provider.registry.ts`
+- Auth: `application/services/integration-auth.service.ts`
+- Redação de campos sensíveis: `application/services/integration-fields-redactor.ts`
+- Commands de auth: `application/commands/connect-integration-auth.command.ts`, `application/commands/confirm-integration-auth.command.ts`
+- Stage do auth: `domain/value-objects/staged-auth-connection.ts`
+- Orchestrator: `application/services/webhook-orchestrator.service.ts`
+- Publisher (dispatcher genérico): `application/services/webhook-event.publisher.ts`
+- Publisher por tipo: `infra/publishers/ecommerce/ecommerce-webhook-event.publisher.ts`
+- Idempotency: `application/services/webhook-idempotency.service.ts`
+- Ports: `domain/repositories/integration-provider.port.ts`
+- Port de publicação: `domain/repositories/integration-webhook-event-publisher.port.ts`
+- Helper refresh: `domain/helpers/execute-with-fresh-token.ts`
+- Canonical payload: `domain/value-objects/canonical-webhook-payload.ts`
+- Tray provider: `infra/providers/tray/`
+- Chamada HTTP compartilhada da Tray: `infra/providers/tray/tray.api.requests.ts`
+- Wiring: `integrations-updated.module.ts` (`integrationProviderClasses`,
+  `integrationWebhookEventPublisherClasses`)
