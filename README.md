@@ -61,28 +61,27 @@ flowchart TB
 
 A Yampi segue o padrão quase todo; a Tray só precisa de código nos dois pontos onde ela é diferente de todo mundo.
 
-## Conectar uma loja: 3 jeitos, 1 resultado
+## Conectar uma loja: 2 jeitos, 1 resultado
 
-Nem toda autenticação funciona igual. O motor sabe lidar com três:
+Nem toda autenticação funciona igual. O motor sabe lidar com dois:
 
 ```mermaid
 flowchart TB
     U[Usuário] --> Q{Como o provider\nautentica?}
 
-    Q -->|OAuth2 com redirect\nex: Yampi| R1[1. pede a authorizationUrl]
+    Q -->|OAuth2 padrão com redirect\nex: Yampi| R1[1. pede a authorizationUrl]
     R1 --> R2[2. usuário autoriza no provider]
     R2 --> R3[3. provider devolve code + state pra gente]
 
-    Q -->|OAuth2 sem redirect\nusuário cola o code| D1[1. usuário cola o code\nnum campo do formulário]
-
-    Q -->|Handshake próprio\nex: Tray| C1[1. formulário com os campos\nque esse provider pede]
+    Q -->|Handshake próprio, fora do padrão\nex: Tray| C1[1. formulário com os campos\nque esse provider pede]
 
     R3 --> X[troca por token]
-    D1 --> X
     C1 --> X
 
     X --> S[(integração salva:\ntoken + segredo de webhook\npróprio, só dela)]
 ```
+
+Só existe JSON pro caso "comum" (OAuth2 com redirect, do jeito padrão). Qualquer coisa fora disso — nome de campo diferente, URL de token que muda por conta, resposta em formato próprio — vira código, mesmo que pareça "quase OAuth2". Não vale a pena deixar o JSON genérico pra um caso só; isso só compensa quando duas integrações precisarem do mesmo jeito torto.
 
 ## Um webhook chegando
 
